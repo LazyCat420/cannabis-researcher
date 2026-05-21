@@ -300,6 +300,107 @@ async def load_state_from_db(session) -> dict:
         "samples": domain_samples,
     }
 
+import asyncio
+CACHE_FILE = os.path.join(os.path.dirname(__file__), "data", "translations_cache.json")
+cache_lock = asyncio.Lock()
+_translation_cache = None
+
+async def load_cache():
+    import json
+    global _translation_cache
+    if _translation_cache is not None:
+        return _translation_cache
+    
+    async with cache_lock:
+        if _translation_cache is not None:
+            return _translation_cache
+            
+        if os.path.exists(CACHE_FILE):
+            try:
+                with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                    _translation_cache = json.load(f)
+            except Exception as e:
+                logger.error(f"Failed to load translation cache: {e}")
+                _translation_cache = {}
+        else:
+            _translation_cache = {}
+        return _translation_cache
+
+async def save_cache():
+    import json
+    global _translation_cache
+    if _translation_cache is None:
+        return
+    async with cache_lock:
+        try:
+            os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
+            with open(CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(_translation_cache, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save translation cache: {e}")
+
+async def translate_to_english(text: str) -> dict:
+    import httpx
+    if not text:
+        return {"translated_text": "", "detected_language": "en"}
+    
+    cleaned_text = text.strip()
+    if not cleaned_text:
+        return {"translated_text": "", "detected_language": "en"}
+        
+    url = "https://translate.googleapis.com/translate_a/single"
+    params = {
+        "client": "gtx",
+        "sl": "auto",
+        "tl": "en",
+        "dt": "t",
+        "q": cleaned_text
+    }
+    
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(url, params=params)
+            if response.status_code == 200:
+                data = response.json()
+                translated_segments = []
+                if data and isinstance(data, list) and len(data) > 0:
+                    segments = data[0]
+                    if isinstance(segments, list):
+                        for segment in segments:
+                            if isinstance(segment, list) and len(segment) > 0:
+                                translated_segments.append(segment[0])
+                    
+                    detected_language = "auto"
+                    if len(data) > 2 and isinstance(data[2], str):
+                        detected_language = data[2]
+                        
+                    translated_text = "".join(translated_segments)
+                    return {
+                        "translated_text": translated_text,
+                        "detected_language": detected_language
+                    }
+    except Exception as e:
+        logger.error(f"Translation failed: {e}")
+        
+    return {"translated_text": text, "detected_language": "unknown"}
+
+async def get_translation_cached(text: str) -> dict:
+    if not text:
+        return {"translated_text": "", "detected_language": "en"}
+        
+    cache = await load_cache()
+    key = text.strip()
+    if key in cache:
+        return cache[key]
+        
+    res = await translate_to_english(text)
+    
+    if res["detected_language"] != "unknown":
+        cache[key] = res
+        await save_cache()
+        
+    return res
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Load initial data and bootstrap DB from CSV files on startup."""
@@ -664,40 +765,104 @@ async def import_strain(request: Request):
             search_query = primary_name
             # Overgrow
             try:
-                posts_og = await scraper_client.collect({
+                search_res = await scraper_client.collect({
                     "source": "discourse",
                     "base_url": "https://overgrow.com",
                     "forum_name": "overgrow",
                     "query": search_query,
                     "limit": 10
                 })
-                await _save_forum_posts_to_db(session, posts_og.get("items", []), "overgrow", strain_orm.id, search_query)
+                topic_ids = []
+                for item in search_res.get("items", []):
+                    tid = item.get("topic_id")
+                    if tid and tid not in topic_ids:
+                        topic_ids.append(tid)
+                    if len(topic_ids) >= 3:
+                        break
+                for tid in topic_ids:
+                    try:
+                        posts_og = await scraper_client.collect({
+                            "source": "discourse",
+                            "base_url": "https://overgrow.com",
+                            "forum_name": "overgrow",
+                            "topic_id": tid,
+                            "limit": 30
+                        })
+                        await _save_forum_posts_to_db(session, posts_og.get("items", []), "overgrow", strain_orm.id, search_query)
+                    except Exception as ex:
+                        logger.error(f"Failed to fetch Overgrow topic {tid} posts: {ex}")
             except Exception as ex:
                 logger.error(f"Failed to scrape Overgrow for {search_query}: {ex}")
 
+            # Helper for XenForo normalization
+            def normalize_xenforo_thread_url(url: str) -> str:
+                if not url:
+                    return ""
+                if "/post-" in url:
+                    url = url.split("/post-")[0]
+                if not url.endswith("/"):
+                    url += "/"
+                return url
+
             # Rollitup
             try:
-                posts_riu = await scraper_client.collect({
+                search_res = await scraper_client.collect({
                     "source": "xenforo",
                     "base_url": "https://www.rollitup.org",
                     "forum_name": "rollitup",
                     "query": search_query,
                     "limit": 10
                 })
-                await _save_forum_posts_to_db(session, posts_riu.get("items", []), "rollitup", strain_orm.id, search_query)
+                thread_urls = []
+                for item in search_res.get("items", []):
+                    turl = normalize_xenforo_thread_url(item.get("url"))
+                    if turl and turl not in thread_urls:
+                        thread_urls.append(turl)
+                    if len(thread_urls) >= 3:
+                        break
+                for turl in thread_urls:
+                    try:
+                        posts_riu = await scraper_client.collect({
+                            "source": "xenforo",
+                            "base_url": "https://www.rollitup.org",
+                            "forum_name": "rollitup",
+                            "thread_url": turl,
+                            "limit": 30
+                        })
+                        await _save_forum_posts_to_db(session, posts_riu.get("items", []), "rollitup", strain_orm.id, search_query)
+                    except Exception as ex:
+                        logger.error(f"Failed to fetch Rollitup thread {turl} posts: {ex}")
             except Exception as ex:
                 logger.error(f"Failed to scrape Rollitup for {search_query}: {ex}")
 
             # THCFarmer
             try:
-                posts_thc = await scraper_client.collect({
+                search_res = await scraper_client.collect({
                     "source": "xenforo",
                     "base_url": "https://www.thcfarmer.com",
                     "forum_name": "thcfarmer",
                     "query": search_query,
                     "limit": 10
                 })
-                await _save_forum_posts_to_db(session, posts_thc.get("items", []), "thcfarmer", strain_orm.id, search_query)
+                thread_urls = []
+                for item in search_res.get("items", []):
+                    turl = normalize_xenforo_thread_url(item.get("url"))
+                    if turl and turl not in thread_urls:
+                        thread_urls.append(turl)
+                    if len(thread_urls) >= 3:
+                        break
+                for turl in thread_urls:
+                    try:
+                        posts_thc = await scraper_client.collect({
+                            "source": "xenforo",
+                            "base_url": "https://www.thcfarmer.com",
+                            "forum_name": "thcfarmer",
+                            "thread_url": turl,
+                            "limit": 30
+                        })
+                        await _save_forum_posts_to_db(session, posts_thc.get("items", []), "thcfarmer", strain_orm.id, search_query)
+                    except Exception as ex:
+                        logger.error(f"Failed to fetch THCFarmer thread {turl} posts: {ex}")
             except Exception as ex:
                 logger.error(f"Failed to scrape THCFarmer for {search_query}: {ex}")
         finally:
@@ -756,12 +921,27 @@ async def strain_detail(strain_name: str):
                 breeder_name = br.name
         
         has_observations = bool(strain.observation_count and strain.observation_count > 0)
+
+        # Translate description to English if not English
+        original_desc = strain.description or ""
+        translated_desc = ""
+        detected_lang = "en"
         
+        if original_desc:
+            try:
+                translation_res = await get_translation_cached(original_desc)
+                translated_desc = translation_res.get("translated_text", "")
+                detected_lang = translation_res.get("detected_language", "en")
+            except Exception as e:
+                logger.error(f"Error while translating strain description: {e}")
+
         result = {
             "name": strain.primary_name,
             "rsp": sample.rsp_number if sample else "",
             "complete": (sample.is_complete if sample else False) or has_observations,
-            "description": strain.description or "",
+            "description": original_desc,
+            "translated_description": translated_desc if detected_lang != "en" and translated_desc != original_desc else None,
+            "detected_language": detected_lang,
             "strain_type": strain.strain_type or "",
             "breeder": breeder_name,
             "lineage": strain.lineage or {},

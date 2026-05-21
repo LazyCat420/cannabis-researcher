@@ -289,7 +289,23 @@
       if (d.strain_type) html += `<div class="meta-item"><div class="label">Type</div><div class="value">${d.strain_type}</div></div>`;
       if (d.avg_flowering_days) html += `<div class="meta-item"><div class="label">Flowering</div><div class="value">${d.avg_flowering_days} days</div></div>`;
       html += `</div>`;
-      if (d.description) html += `<p style="color:var(--text-secondary);font-size:13px;line-height:1.5;margin-top:8px">${d.description}</p>`;
+      if (d.description) {
+        if (d.translated_description) {
+          html += `<div class="description-wrap" style="margin-top:8px">
+            <p class="desc-translated" style="color:var(--text-secondary);font-size:13px;line-height:1.5;font-style:italic">
+              ${escapeHtml(d.translated_description)}
+            </p>
+            <p class="desc-original" style="display:none;color:var(--text-secondary);font-size:13px;line-height:1.5">
+              ${escapeHtml(d.description)}
+            </p>
+            <button class="translate-toggle-btn" data-lang="${escapeHtml(d.detected_language || 'es')}" style="background:none;border:none;color:var(--accent-cyan);font-size:11px;font-weight:600;cursor:pointer;padding:4px 0;margin-top:4px;display:block">
+              Auto-translated to English. Show original (${(d.detected_language || 'es').toUpperCase()})
+            </button>
+          </div>`;
+        } else {
+          html += `<p style="color:var(--text-secondary);font-size:13px;line-height:1.5;margin-top:8px">${escapeHtml(d.description)}</p>`;
+        }
+      }
       if (d.lineage) {
         let lineageText = '';
         if (Array.isArray(d.lineage)) {
@@ -538,6 +554,24 @@
         } else {
           quote.textContent = `"${quote.dataset.short}"`;
           expandBtn.textContent = 'Show More';
+        }
+      }
+
+      const translateToggleBtn = e.target.closest('.translate-toggle-btn');
+      if (translateToggleBtn) {
+        const wrap = translateToggleBtn.closest('.description-wrap');
+        const descTrans = wrap.querySelector('.desc-translated');
+        const descOrig = wrap.querySelector('.desc-original');
+        const lang = translateToggleBtn.dataset.lang || 'es';
+        
+        if (descTrans.style.display === 'none') {
+          descTrans.style.display = 'block';
+          descOrig.style.display = 'none';
+          translateToggleBtn.textContent = `Auto-translated to English. Show original (${lang.toUpperCase()})`;
+        } else {
+          descTrans.style.display = 'none';
+          descOrig.style.display = 'block';
+          translateToggleBtn.textContent = 'Show English translation';
         }
       }
     });

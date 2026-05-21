@@ -270,52 +270,52 @@ async def scrape_seedfinder_strain(
             data["description"] = desc_text[:2000]
 
     # ── Lineage (parent strains) ──
-    lineage_start = html.find("Lineage")
-    if lineage_start == -1:
-        lineage_start = html.find("lineage")
-    hybrids_start = html.find("Hybrids")
-    if hybrids_start == -1:
-        hybrids_start = html.find("Crossbreeds")
-
-    if lineage_start > 0:
-        end = hybrids_start if hybrids_start > lineage_start else lineage_start + 8000
-        lineage_section = html[lineage_start:end]
-
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, "html.parser")
+    lineage_div = soup.find(id="lineage")
+    if lineage_div:
         seen_lineage = set()
-        for m in re.finditer(
-            r'/strain-info/([^"]+?)/([^"]+?)"[^>]*>([^<]+)</a>',
-            lineage_section,
-        ):
-            parent_slug = m.group(1)
-            parent_breeder = m.group(2)
-            parent_name = m.group(3).strip()
-            key = f"{parent_name.lower()}|{parent_breeder}"
-            if key not in seen_lineage and parent_slug != strain_slug:
-                seen_lineage.add(key)
-                data["lineage"].append({
-                    "name": parent_name,
-                    "breeder": parent_breeder.replace("-", " ").title(),
-                    "strain_slug": parent_slug,
-                    "breeder_slug": parent_breeder,
-                })
+        for a in lineage_div.find_all("a", href=True):
+            href = a["href"]
+            if any(term in href for term in ["/genealogy", "/family-tree", "/hybrid-map"]):
+                continue
+            m = re.search(r'/strain-info/([^/]+)/([^/]+)/?$', href)
+            if m:
+                parent_slug = m.group(1)
+                parent_breeder = m.group(2)
+                parent_name = a.get_text().strip()
+                key = f"{parent_name.lower()}|{parent_breeder}"
+                if key not in seen_lineage and parent_slug != strain_slug:
+                    seen_lineage.add(key)
+                    data["lineage"].append({
+                        "name": parent_name,
+                        "breeder": parent_breeder.replace("-", " ").title(),
+                        "strain_slug": parent_slug,
+                        "breeder_slug": parent_breeder,
+                    })
 
     # ── Hybrids/Crossbreeds ──
-    if hybrids_start > 0:
-        hybrids_section = html[hybrids_start:hybrids_start + 10000]
+    hybrids_div = soup.find(id="hybrids")
+    if hybrids_div:
         seen_hybrids = set()
-        for m in re.finditer(
-            r'/strain-info/([^"]+?)/([^"]+?)"[^>]*>([^<]+)</a>',
-            hybrids_section,
-        ):
-            h_name = m.group(3).strip()
-            h_breeder = m.group(2)
-            key = f"{h_name.lower()}|{h_breeder}"
-            if key not in seen_hybrids:
-                seen_hybrids.add(key)
-                data["hybrids"].append({
-                    "name": h_name,
-                    "breeder": h_breeder.replace("-", " ").title(),
-                })
+        for a in hybrids_div.find_all("a", href=True):
+            href = a["href"]
+            if any(term in href for term in ["/genealogy", "/family-tree", "/hybrid-map"]):
+                continue
+            m = re.search(r'/strain-info/([^/]+)/([^/]+)/?$', href)
+            if m:
+                h_slug = m.group(1)
+                h_breeder = m.group(2)
+                h_name = a.get_text().strip()
+                if "(" in h_name:
+                    h_name = h_name.split("(")[0].strip()
+                key = f"{h_name.lower()}|{h_breeder}"
+                if key not in seen_hybrids and h_slug != strain_slug:
+                    seen_hybrids.add(key)
+                    data["hybrids"].append({
+                        "name": h_name,
+                        "breeder": h_breeder.replace("-", " ").title(),
+                    })
         data["hybrids"] = data["hybrids"][:50]
 
     # ── Awards ──

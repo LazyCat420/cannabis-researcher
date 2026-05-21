@@ -19,3 +19,5 @@ aiofiles>=23.2.0
 SQLAlchemy>=2.0.23
 asyncpg>=0.29.0
 greenlet>=3.5.0
+beautifulsoup4>=4.12.0
+
