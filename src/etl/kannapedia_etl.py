@@ -157,13 +157,23 @@ def _build_chemical_profile(chemical_content: dict[str, Any]) -> ChemicalProfile
         "THCV": "thcv", "CBC": "cbc", "CBG": "cbg", "CBN": "cbn",
     }
     for raw_name, value_str in cannabinoids.items():
-        for cann_key, field_name in cann_map.items():
-            if cann_key.lower() in raw_name.lower():
-                try:
-                    setattr(profile, field_name, float(str(value_str).rstrip("%")))
-                except ValueError:
-                    pass
-                break
+        # Use exact match (case-insensitive) to prevent 'THC' matching 'THCA'
+        raw_upper = raw_name.strip().upper()
+        matched_field = cann_map.get(raw_upper)
+        if matched_field:
+            try:
+                setattr(profile, matched_field, float(str(value_str).rstrip("%")))
+            except ValueError:
+                pass
+        else:
+            # Fallback: try substring match for non-standard names
+            for cann_key, field_name in cann_map.items():
+                if cann_key.lower() in raw_name.lower():
+                    try:
+                        setattr(profile, field_name, float(str(value_str).rstrip("%")))
+                    except ValueError:
+                        pass
+                    break
 
     # Terpenoid mapping
     terp_map = {

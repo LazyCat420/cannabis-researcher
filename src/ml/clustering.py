@@ -46,6 +46,59 @@ def get_clip_resources():
             logger.error(f"Failed to load CLIP model: {e}")
     return _clip_model, _clip_processor
 
+async def is_budding_plant_image(image_url: str) -> bool:
+    """Download image and use CLIP zero-shot classification to verify if it depicts a budding plant."""
+    if not HAS_ML_LIBRARIES:
+        # Default to True if ML libraries are missing so it doesn't break basic functionality
+        return True
+    try:
+        model, processor = get_clip_resources()
+        if not model or not processor:
+            return True
+            
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(image_url)
+            if resp.status_code != 200:
+                logger.warning(f"Failed to download image for ML classification from {image_url}: status {resp.status_code}")
+                return False
+            
+            from io import BytesIO
+            img = Image.open(BytesIO(resp.content)).convert("RGB")
+            
+            # Target (positive) vs Negative prompts
+            candidate_labels = [
+                "a budding cannabis plant",
+                "a close-up of a cannabis bud",
+                "marijuana flower in bloom",
+                "a product label",
+                "seedlings",
+                "empty rooms",
+                "text"
+            ]
+            
+            # Process image and text prompts
+            inputs = processor(
+                text=candidate_labels,
+                images=img,
+                return_tensors="pt",
+                padding=True
+            )
+            
+            with torch.no_grad():
+                outputs = model(**inputs)
+                logits_per_image = outputs.logits_per_image # image-text similarity scores
+                probs = logits_per_image.softmax(dim=1).cpu().numpy()[0]
+                
+            # Combine positive probabilities (first three labels)
+            positive_score = float(probs[0] + probs[1] + probs[2])
+            logger.info(f"Image {image_url} classification: positive_score={positive_score:.4f} (probs: {probs})")
+            
+            return positive_score >= 0.45
+            
+    except Exception as e:
+        logger.warning(f"Budding plant classification failed for {image_url}: {e}")
+        return False
+
 async def extract_image_embedding(image_url: str) -> list[float]:
     """Download image and extract feature vector (CLIP or color histogram fallback)."""
     if HAS_ML_LIBRARIES:

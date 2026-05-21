@@ -85,5 +85,37 @@ class ScraperClient:
         data = await self.collect(payload)
         return data.get("items", [])
 
+    async def collect_kannapedia(
+        self,
+        strain_name: str,
+        limit: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Search Kannapedia by strain name and return raw strain data payloads.
+        
+        The scraper-service searches the Kannapedia index page for matching
+        strain names, resolves them to RSP numbers, then scrapes each page
+        via Playwright to extract genomic/chemical data.
+        """
+        payload = {
+            "source": "kannapedia",
+            "query": strain_name,
+            "limit": limit,
+        }
+        data = await self.collect(payload)
+        return data.get("items", [])
+
+    async def collect_kannapedia_by_rsp(
+        self,
+        rsp_numbers: List[str],
+    ) -> List[Dict[str, Any]]:
+        """Scrape specific Kannapedia strain pages by RSP number."""
+        payload = {
+            "source": "kannapedia",
+            "rsp_numbers": rsp_numbers,
+            "limit": len(rsp_numbers),
+        }
+        data = await self.collect(payload)
+        return data.get("items", [])
+
     async def close(self):
         await self.client.aclose()

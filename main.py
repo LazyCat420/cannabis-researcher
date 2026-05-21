@@ -612,6 +612,13 @@ async def list_strains(
                             "forum_name": "thcfarmer",
                             "query": search,
                             "limit": 1
+                        }),
+                        scraper_client.collect({
+                            "source": "xenforo",
+                            "base_url": "https://www.icmag.com",
+                            "forum_name": "icmag",
+                            "query": search,
+                            "limit": 1
                         })
                     ]
                     forum_results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -640,8 +647,45 @@ async def list_strains(
         return {"strains": results, "count": len(results)}
 
 
-async def _save_forum_posts_to_db(session, posts: list[dict], source_name: str, canonical_id: str, reported_strain: str):
+def _is_post_relevant(body: str, title: str, strain_name: str) -> bool:
+    if not strain_name:
+        return False
+    body_lower = (body or "").lower()
+    title_lower = (title or "").lower()
+    strain_lower = strain_name.lower()
+
+    # 1. Direct match on either title or body
+    if strain_lower in title_lower:
+        # If thread title contains the strain name, the entire thread is relevant
+        return True
+    if strain_lower in body_lower:
+        return True
+
+    # 2. Match with punctuation/spacing normalized (e.g. "Jack's Cleaner" -> "jackscleaner")
+    import re
+    strain_norm = re.sub(r"[^a-z0-9]", "", strain_lower)
+    title_norm = re.sub(r"[^a-z0-9]", "", title_lower)
+    body_norm = re.sub(r"[^a-z0-9]", "", body_lower)
+
+    if strain_norm in title_norm:
+        return True
+    if strain_norm in body_norm:
+        return True
+
+    # 3. Match without trailing 's' if the strain name is e.g. "jacks" (to catch "jack cleaner")
+    if strain_norm.startswith("jacks"):
+        alt_norm = strain_norm.replace("jacks", "jack", 1)
+        if alt_norm in title_norm or alt_norm in body_norm:
+            return True
+
+    return False
+
+
+async def _save_forum_posts_to_db(session, posts: list[dict], source_name: str, canonical_id: str, reported_strain: str) -> tuple[int, int]:
     from datetime import datetime
+    from src.ml.clustering import is_budding_plant_image
+    posts_saved = 0
+    images_saved = 0
     for p in posts:
         # Check if exists
         stmt = select(ObservationORM).where(ObservationORM.source_id == str(p.get("id")))
@@ -649,11 +693,15 @@ async def _save_forum_posts_to_db(session, posts: list[dict], source_name: str, 
         if existing:
             continue
 
-        created_at_str = p.get("created_at")
-        dt = datetime.fromisoformat(created_at_str).replace(tzinfo=None) if created_at_str else datetime.utcnow()
-
         title = p.get("title", "")
         body = p.get("body", "")
+
+        # Check relevance
+        if not _is_post_relevant(body, title, reported_strain):
+            continue
+
+        created_at_str = p.get("created_at")
+        dt = datetime.fromisoformat(created_at_str).replace(tzinfo=None) if created_at_str else datetime.utcnow()
 
         obs = ObservationORM(
             source_name=source_name,
@@ -667,15 +715,20 @@ async def _save_forum_posts_to_db(session, posts: list[dict], source_name: str, 
         )
         session.add(obs)
         await session.flush()
+        posts_saved += 1
 
-        # Save associated images
+        # Save associated images (only if they are classified as budding plants)
         image_urls = p.get("image_urls", [])
         for url in image_urls:
-            img_orm = ObservationImageORM(
-                observation_id=obs.id,
-                image_url=url
-            )
-            session.add(img_orm)
+            if await is_budding_plant_image(url):
+                img_orm = ObservationImageORM(
+                    observation_id=obs.id,
+                    image_url=url
+                )
+                session.add(img_orm)
+                images_saved += 1
+                
+    return posts_saved, images_saved
 
 
 @app.post("/api/strains/import")
@@ -683,200 +736,335 @@ async def import_strain(request: Request):
     payload = await request.json()
     strain_slug = payload.get("strain_slug")
     breeder_slug = payload.get("breeder_slug")
+    force = payload.get("force", False)
     if not strain_slug or not breeder_slug:
         return JSONResponse({"error": "Missing strain_slug or breeder_slug"}, status_code=400)
 
-    async for session in get_session():
-        # Check if already imported
-        alias_source_name = "forum" if breeder_slug == "forum-import" else "seedfinder"
-        stmt_alias = select(StrainAliasORM).where(
-            (StrainAliasORM.source_name == alias_source_name) & 
-            (StrainAliasORM.source_id == f"{strain_slug}:{breeder_slug}")
-        )
-        alias = (await session.execute(stmt_alias)).scalars().first()
-        if alias:
-            stmt_cs = select(CanonicalStrainORM).where(CanonicalStrainORM.id == alias.canonical_strain_id)
-            strain = (await session.execute(stmt_cs)).scalars().first()
-            if strain:
-                return await strain_detail(strain.primary_name)
+    from fastapi.responses import StreamingResponse
+    import json
 
-        if breeder_slug == "forum-import":
-            primary_name = strain_slug.replace("-", " ").title()
-            sf_data = {
-                "name": primary_name,
-                "breeder": "Unknown Breeder",
-                "type": "Unknown",
-                "flowering_time_days": None,
-                "description": f"Imported from forum discussions for {primary_name}.",
-                "lineage": {},
-            }
-        else:
-            # Scrape from SeedFinder
-            from src.collectors.seedfinder_collector import scrape_seedfinder_strain
-            sf_data = await scrape_seedfinder_strain(strain_slug, breeder_slug)
-            if not sf_data or not sf_data.get("name"):
-                return JSONResponse({"error": "Strain detail not found on SeedFinder"}, status_code=404)
+    async def event_generator():
+        total_posts = 0
+        total_images = 0
 
-        # Create breeder if not exists
-        breeder_name = sf_data.get("breeder") or breeder_slug.replace("-", " ").title()
-        stmt_breeder = select(BreederORM).where(BreederORM.name.ilike(breeder_name))
-        breeder = (await session.execute(stmt_breeder)).scalars().first()
-        if not breeder:
-            breeder = BreederORM(name=breeder_name)
-            session.add(breeder)
-            await session.flush()
+        yield json.dumps({"type": "progress", "message": "Initializing...", "posts": 0, "images": 0}) + "\n"
 
-        # Create CanonicalStrain
-        primary_name = sf_data["name"]
-        
-        # Ensure name uniqueness
-        stmt_cs_name = select(CanonicalStrainORM).where(CanonicalStrainORM.primary_name.ilike(primary_name))
-        strain_orm = (await session.execute(stmt_cs_name)).scalars().first()
-        if not strain_orm:
-            canonical_name = primary_name.replace(" ", "_")
-            stmt_cs_canon = select(CanonicalStrainORM).where(CanonicalStrainORM.primary_name.ilike(canonical_name))
-            strain_orm = (await session.execute(stmt_cs_canon)).scalars().first()
-            if not strain_orm:
-                strain_orm = CanonicalStrainORM(
-                    primary_name=canonical_name,
-                    breeder_id=breeder.id,
-                    strain_type=sf_data.get("type"),
-                    avg_flowering_days=sf_data.get("flowering_time_days"),
-                    description=sf_data.get("description"),
-                    lineage=sf_data.get("lineage") or {},
-                )
-                session.add(strain_orm)
+        async for session in get_session():
+            # Check if already imported
+            alias_source_name = "forum" if breeder_slug == "forum-import" else "seedfinder"
+            stmt_alias = select(StrainAliasORM).where(
+                (StrainAliasORM.source_name == alias_source_name) & 
+                (StrainAliasORM.source_id == f"{strain_slug}:{breeder_slug}")
+            )
+            alias = (await session.execute(stmt_alias)).scalars().first()
+            if alias:
+                stmt_cs = select(CanonicalStrainORM).where(CanonicalStrainORM.id == alias.canonical_strain_id)
+                strain_orm = (await session.execute(stmt_cs)).scalars().first()
+                if strain_orm and not force:
+                    detail_data = await strain_detail(strain_orm.primary_name)
+                    yield json.dumps({"type": "done", "data": detail_data}) + "\n"
+                    return
+                
+                # If force=True, we proceed and clean up existing observations and aliases
+                if force:
+                    if strain_orm:
+                        from sqlalchemy import delete
+                        obs_stmt = select(ObservationORM.id).where(ObservationORM.canonical_strain_id == strain_orm.id)
+                        obs_ids = (await session.execute(obs_stmt)).scalars().all()
+                        if obs_ids:
+                            await session.execute(delete(ObservationImageORM).where(ObservationImageORM.observation_id.in_(obs_ids)))
+                            await session.execute(delete(ObservationORM).where(ObservationORM.id.in_(obs_ids)))
+                        # Reset strain attributes (will be populated below)
+                        strain_orm.description = None
+                        strain_orm.lineage = {}
+                        strain_orm.strain_type = None
+                        strain_orm.avg_flowering_days = None
+                        strain_orm.observation_count = 0
+                        await session.flush()
+                    await session.delete(alias)
+                    await session.flush()
+
+            yield json.dumps({"type": "progress", "message": "Fetching metadata...", "posts": 0, "images": 0}) + "\n"
+
+            if breeder_slug == "forum-import":
+                primary_name = strain_slug.replace("-", " ").title()
+                sf_data = {
+                    "name": primary_name,
+                    "breeder": "Unknown Breeder",
+                    "type": "Unknown",
+                    "flowering_time_days": None,
+                    "description": f"Imported from forum discussions for {primary_name}.",
+                    "lineage": {},
+                }
+            else:
+                # Scrape from SeedFinder
+                from src.collectors.seedfinder_collector import scrape_seedfinder_strain
+                sf_data = await scrape_seedfinder_strain(strain_slug, breeder_slug)
+                if not sf_data or not sf_data.get("name"):
+                    yield json.dumps({"type": "error", "error": "Strain detail not found on SeedFinder"}) + "\n"
+                    return
+
+            # Create breeder if not exists
+            breeder_name = sf_data.get("breeder") or breeder_slug.replace("-", " ").title()
+            stmt_breeder = select(BreederORM).where(BreederORM.name.ilike(breeder_name))
+            breeder = (await session.execute(stmt_breeder)).scalars().first()
+            if not breeder:
+                breeder = BreederORM(name=breeder_name)
+                session.add(breeder)
                 await session.flush()
 
-        # Create alias
-        alias_orm = StrainAliasORM(
-            canonical_strain_id=strain_orm.id,
-            name=primary_name,
-            source_name=alias_source_name,
-            source_id=f"{strain_slug}:{breeder_slug}",
-        )
-        session.add(alias_orm)
-        await session.flush()
+            # Create CanonicalStrain
+            primary_name = sf_data["name"]
+            
+            # Ensure name uniqueness
+            stmt_cs_name = select(CanonicalStrainORM).where(CanonicalStrainORM.primary_name.ilike(primary_name))
+            strain_orm = (await session.execute(stmt_cs_name)).scalars().first()
+            if not strain_orm:
+                canonical_name = primary_name.replace(" ", "_")
+                stmt_cs_canon = select(CanonicalStrainORM).where(CanonicalStrainORM.primary_name.ilike(canonical_name))
+                strain_orm = (await session.execute(stmt_cs_canon)).scalars().first()
+                if not strain_orm:
+                    strain_orm = CanonicalStrainORM(
+                        primary_name=canonical_name,
+                        breeder_id=breeder.id,
+                        strain_type=sf_data.get("type"),
+                        avg_flowering_days=sf_data.get("flowering_time_days"),
+                        description=sf_data.get("description"),
+                        lineage=sf_data.get("lineage") or {},
+                    )
+                    session.add(strain_orm)
+                    await session.flush()
+            else:
+                # If it already exists, update its attributes from sf_data
+                strain_orm.strain_type = sf_data.get("type") or strain_orm.strain_type
+                strain_orm.avg_flowering_days = sf_data.get("flowering_time_days") or strain_orm.avg_flowering_days
+                strain_orm.description = sf_data.get("description") or strain_orm.description
+                strain_orm.lineage = sf_data.get("lineage") or strain_orm.lineage
+                await session.flush()
 
-        # Scrape forum threads for observations and pictures
-        from src.scraper_client import ScraperClient
-        scraper_client = ScraperClient()
-        try:
-            search_query = primary_name
-            # Overgrow
+            # Create alias
+            alias_orm = StrainAliasORM(
+                canonical_strain_id=strain_orm.id,
+                name=primary_name,
+                source_name=alias_source_name,
+                source_id=f"{strain_slug}:{breeder_slug}",
+            )
+            session.add(alias_orm)
+            await session.flush()
+
+            # ── Kannapedia genomic data lookup ──
+            yield json.dumps({"type": "progress", "message": "Searching Kannapedia for genomic data...", "posts": 0, "images": 0}) + "\n"
+
+            from src.scraper_client import ScraperClient
+            scraper_client = ScraperClient()
             try:
-                search_res = await scraper_client.collect({
-                    "source": "discourse",
-                    "base_url": "https://overgrow.com",
-                    "forum_name": "overgrow",
-                    "query": search_query,
-                    "limit": 10
-                })
-                topic_ids = []
-                for item in search_res.get("items", []):
-                    tid = item.get("topic_id")
-                    if tid and tid not in topic_ids:
-                        topic_ids.append(tid)
-                    if len(topic_ids) >= 3:
-                        break
-                for tid in topic_ids:
+                kannapedia_results = await scraper_client.collect_kannapedia(
+                    strain_name=primary_name,
+                    limit=3,
+                )
+
+                kannapedia_ingested = 0
+                for kanna_item in kannapedia_results:
                     try:
-                        posts_og = await scraper_client.collect({
-                            "source": "discourse",
-                            "base_url": "https://overgrow.com",
-                            "forum_name": "overgrow",
-                            "topic_id": tid,
-                            "limit": 30
-                        })
-                        await _save_forum_posts_to_db(session, posts_og.get("items", []), "overgrow", strain_orm.id, search_query)
-                    except Exception as ex:
-                        logger.error(f"Failed to fetch Overgrow topic {tid} posts: {ex}")
-            except Exception as ex:
-                logger.error(f"Failed to scrape Overgrow for {search_query}: {ex}")
+                        # Build existing_strains lookup for ETL
+                        from src.models.strain import CanonicalStrain as DomainStrain
+                        existing_strains_lookup = {
+                            strain_orm.primary_name: DomainStrain(
+                                id=strain_orm.id,
+                                primary_name=strain_orm.primary_name,
+                                strain_type=strain_orm.strain_type,
+                                lineage=strain_orm.lineage or {},
+                                description=strain_orm.description,
+                            )
+                        }
 
-            # Helper for XenForo normalization
-            def normalize_xenforo_thread_url(url: str) -> str:
-                if not url:
-                    return ""
-                if "/post-" in url:
-                    url = url.split("/post-")[0]
-                if not url.endswith("/"):
-                    url += "/"
-                return url
+                        result = ingest_kannapedia_record(kanna_item, existing_strains_lookup)
+                        await save_domain_models_to_db(session, result)
+                        kannapedia_ingested += 1
 
-            # Rollitup
+                        # Update the canonical strain with chemical averages from the sample
+                        sample_domain = result["sample"]
+                        if sample_domain.chemical_profile:
+                            cp = sample_domain.chemical_profile
+                            if cp.thc is not None:
+                                strain_orm.avg_thc_pct = cp.thc
+                            if cp.cbd is not None:
+                                strain_orm.avg_cbd_pct = cp.cbd
+                            # Extract dominant terpenes
+                            terp_dict = {}
+                            for attr in ["myrcene", "limonene", "caryophyllene", "pinene_alpha",
+                                         "linalool", "humulene", "terpinolene", "ocimene"]:
+                                val = getattr(cp, attr, None)
+                                if val and val > 0:
+                                    terp_dict[attr] = val
+                            if terp_dict:
+                                sorted_terps = sorted(terp_dict.items(), key=lambda x: x[1], reverse=True)
+                                strain_orm.dominant_terpenes = [t[0] for t in sorted_terps[:5]]
+                            await session.flush()
+
+                        logger.info(f"Ingested Kannapedia sample for {primary_name}: RSP={sample_domain.rsp_number}")
+                    except Exception as kex:
+                        logger.error(f"Failed to ingest Kannapedia record for {primary_name}: {kex}")
+
+                if kannapedia_ingested > 0:
+                    yield json.dumps({"type": "progress", "message": f"Kannapedia: {kannapedia_ingested} genomic sample(s) ingested.", "posts": 0, "images": 0}) + "\n"
+                else:
+                    yield json.dumps({"type": "progress", "message": "No Kannapedia genomic data found.", "posts": 0, "images": 0}) + "\n"
+            except Exception as e:
+                logger.error(f"Kannapedia lookup failed for {primary_name}: {e}")
+                yield json.dumps({"type": "progress", "message": "Kannapedia lookup failed, continuing with forums...", "posts": 0, "images": 0}) + "\n"
+
+            yield json.dumps({"type": "progress", "message": "Scraping Overgrow...", "posts": 0, "images": 0}) + "\n"
+
+            # Scrape forum threads for observations and pictures
             try:
-                search_res = await scraper_client.collect({
-                    "source": "xenforo",
-                    "base_url": "https://www.rollitup.org",
-                    "forum_name": "rollitup",
-                    "query": search_query,
-                    "limit": 10
-                })
-                thread_urls = []
-                for item in search_res.get("items", []):
-                    turl = normalize_xenforo_thread_url(item.get("url"))
-                    if turl and turl not in thread_urls:
-                        thread_urls.append(turl)
-                    if len(thread_urls) >= 3:
-                        break
-                for turl in thread_urls:
-                    try:
-                        posts_riu = await scraper_client.collect({
-                            "source": "xenforo",
-                            "base_url": "https://www.rollitup.org",
-                            "forum_name": "rollitup",
-                            "thread_url": turl,
-                            "limit": 30
-                        })
-                        await _save_forum_posts_to_db(session, posts_riu.get("items", []), "rollitup", strain_orm.id, search_query)
-                    except Exception as ex:
-                        logger.error(f"Failed to fetch Rollitup thread {turl} posts: {ex}")
-            except Exception as ex:
-                logger.error(f"Failed to scrape Rollitup for {search_query}: {ex}")
+                search_query = primary_name
+                # Overgrow
+                try:
+                    search_res = await scraper_client.collect({
+                        "source": "discourse",
+                        "base_url": "https://overgrow.com",
+                        "forum_name": "overgrow",
+                        "query": f'"{search_query}"',
+                        "limit": 30
+                    })
+                    p_saved, i_saved = await _save_forum_posts_to_db(session, search_res.get("items", []), "overgrow", strain_orm.id, search_query)
+                    total_posts += p_saved
+                    total_images += i_saved
+                    yield json.dumps({"type": "progress", "message": "Overgrow complete. Scraping Rollitup...", "posts": total_posts, "images": total_images}) + "\n"
+                except Exception as ex:
+                    logger.error(f"Failed to scrape Overgrow for {search_query}: {ex}")
 
-            # THCFarmer
-            try:
-                search_res = await scraper_client.collect({
-                    "source": "xenforo",
-                    "base_url": "https://www.thcfarmer.com",
-                    "forum_name": "thcfarmer",
-                    "query": search_query,
-                    "limit": 10
-                })
-                thread_urls = []
-                for item in search_res.get("items", []):
-                    turl = normalize_xenforo_thread_url(item.get("url"))
-                    if turl and turl not in thread_urls:
-                        thread_urls.append(turl)
-                    if len(thread_urls) >= 3:
-                        break
-                for turl in thread_urls:
-                    try:
-                        posts_thc = await scraper_client.collect({
-                            "source": "xenforo",
-                            "base_url": "https://www.thcfarmer.com",
-                            "forum_name": "thcfarmer",
-                            "thread_url": turl,
-                            "limit": 30
-                        })
-                        await _save_forum_posts_to_db(session, posts_thc.get("items", []), "thcfarmer", strain_orm.id, search_query)
-                    except Exception as ex:
-                        logger.error(f"Failed to fetch THCFarmer thread {turl} posts: {ex}")
-            except Exception as ex:
-                logger.error(f"Failed to scrape THCFarmer for {search_query}: {ex}")
-        finally:
-            await scraper_client.close()
+                # Helper for XenForo normalization
+                def normalize_xenforo_thread_url(url: str) -> str:
+                    if not url:
+                        return ""
+                    if "/post-" in url:
+                        return url
+                    if not url.endswith("/"):
+                        url += "/"
+                    return url
 
-        # Update observation count on the canonical strain
-        stmt_obs_count = select(func.count()).select_from(ObservationORM).where(
-            ObservationORM.canonical_strain_id == strain_orm.id
-        )
-        obs_count = (await session.execute(stmt_obs_count)).scalar() or 0
-        strain_orm.observation_count = obs_count
+                # Rollitup
+                try:
+                    search_res = await scraper_client.collect({
+                        "source": "xenforo",
+                        "base_url": "https://www.rollitup.org",
+                        "forum_name": "rollitup",
+                        "query": f'"{search_query}"',
+                        "limit": 10
+                    })
+                    thread_urls = []
+                    for item in search_res.get("items", []):
+                        turl = normalize_xenforo_thread_url(item.get("url"))
+                        if turl and turl not in thread_urls:
+                            thread_urls.append(turl)
+                        if len(thread_urls) >= 3:
+                            break
+                    for idx, turl in enumerate(thread_urls):
+                        yield json.dumps({"type": "progress", "message": f"Scraping Rollitup thread {idx+1}/{len(thread_urls)}...", "posts": total_posts, "images": total_images}) + "\n"
+                        try:
+                            posts_riu = await scraper_client.collect({
+                                "source": "xenforo",
+                                "base_url": "https://www.rollitup.org",
+                                "forum_name": "rollitup",
+                                "thread_url": turl,
+                                "limit": 30
+                            })
+                            p_saved, i_saved = await _save_forum_posts_to_db(session, posts_riu.get("items", []), "rollitup", strain_orm.id, search_query)
+                            total_posts += p_saved
+                            total_images += i_saved
+                        except Exception as ex:
+                            logger.error(f"Failed to fetch Rollitup thread {turl} posts: {ex}")
+                    yield json.dumps({"type": "progress", "message": "Rollitup complete. Scraping THCFarmer...", "posts": total_posts, "images": total_images}) + "\n"
+                except Exception as ex:
+                    logger.error(f"Failed to scrape Rollitup for {search_query}: {ex}")
 
-        await session.commit()
-        return await strain_detail(strain_orm.primary_name)
+                # THCFarmer
+                try:
+                    search_res = await scraper_client.collect({
+                        "source": "xenforo",
+                        "base_url": "https://www.thcfarmer.com",
+                        "forum_name": "thcfarmer",
+                        "query": f'"{search_query}"',
+                        "limit": 10
+                    })
+                    thread_urls = []
+                    for item in search_res.get("items", []):
+                        turl = normalize_xenforo_thread_url(item.get("url"))
+                        if turl and turl not in thread_urls:
+                            thread_urls.append(turl)
+                        if len(thread_urls) >= 3:
+                            break
+                    for idx, turl in enumerate(thread_urls):
+                        yield json.dumps({"type": "progress", "message": f"Scraping THCFarmer thread {idx+1}/{len(thread_urls)}...", "posts": total_posts, "images": total_images}) + "\n"
+                        try:
+                            posts_thc = await scraper_client.collect({
+                                "source": "xenforo",
+                                "base_url": "https://www.thcfarmer.com",
+                                "forum_name": "thcfarmer",
+                                "thread_url": turl,
+                                "limit": 30
+                            })
+                            p_saved, i_saved = await _save_forum_posts_to_db(session, posts_thc.get("items", []), "thcfarmer", strain_orm.id, search_query)
+                            total_posts += p_saved
+                            total_images += i_saved
+                        except Exception as ex:
+                            logger.error(f"Failed to fetch THCFarmer thread {turl} posts: {ex}")
+                    yield json.dumps({"type": "progress", "message": "THCFarmer complete. Scraping ICMag...", "posts": total_posts, "images": total_images}) + "\n"
+                except Exception as ex:
+                    logger.error(f"Failed to scrape THCFarmer for {search_query}: {ex}")
+
+                # ICMag
+                try:
+                    search_res = await scraper_client.collect({
+                        "source": "xenforo",
+                        "base_url": "https://www.icmag.com",
+                        "forum_name": "icmag",
+                        "query": f'"{search_query}"',
+                        "limit": 10
+                    })
+                    thread_urls = []
+                    for item in search_res.get("items", []):
+                        turl = normalize_xenforo_thread_url(item.get("url"))
+                        if turl and turl not in thread_urls:
+                            thread_urls.append(turl)
+                        if len(thread_urls) >= 3:
+                            break
+                    for idx, turl in enumerate(thread_urls):
+                        yield json.dumps({"type": "progress", "message": f"Scraping ICMag thread {idx+1}/{len(thread_urls)}...", "posts": total_posts, "images": total_images}) + "\n"
+                        try:
+                            posts_icmag = await scraper_client.collect({
+                                "source": "xenforo",
+                                "base_url": "https://www.icmag.com",
+                                "forum_name": "icmag",
+                                "thread_url": turl,
+                                "limit": 30
+                            })
+                            p_saved, i_saved = await _save_forum_posts_to_db(session, posts_icmag.get("items", []), "icmag", strain_orm.id, search_query)
+                            total_posts += p_saved
+                            total_images += i_saved
+                        except Exception as ex:
+                            logger.error(f"Failed to fetch ICMag thread {turl} posts: {ex}")
+                except Exception as ex:
+                    logger.error(f"Failed to scrape ICMag for {search_query}: {ex}")
+            finally:
+                await scraper_client.close()
+
+            # Update observation count on the canonical strain
+            stmt_obs_count = select(func.count()).select_from(ObservationORM).where(
+                ObservationORM.canonical_strain_id == strain_orm.id
+            )
+            obs_count = (await session.execute(stmt_obs_count)).scalar() or 0
+            strain_orm.observation_count = obs_count
+
+            await session.commit()
+            
+            detail_data = await strain_detail(strain_orm.primary_name)
+            yield json.dumps({"type": "done", "data": detail_data}) + "\n"
+            break
+
+    return StreamingResponse(event_generator(), media_type="application/x-ndjson")
 
 # ----- Strain Detail ----- #
 
@@ -935,8 +1123,27 @@ async def strain_detail(strain_name: str):
             except Exception as e:
                 logger.error(f"Error while translating strain description: {e}")
 
+        # Locate strain_slug and breeder_slug from aliases
+        strain_slug = ""
+        breeder_slug = ""
+        stmt_aliases = select(StrainAliasORM).where(StrainAliasORM.canonical_strain_id == strain.id)
+        aliases = (await session.execute(stmt_aliases)).scalars().all()
+        for a in aliases:
+            if a.source_name in ("seedfinder", "forum") and a.source_id and ":" in a.source_id:
+                parts = a.source_id.split(":", 1)
+                strain_slug = parts[0]
+                breeder_slug = parts[1]
+                break
+        
+        if not strain_slug:
+            strain_slug = strain.primary_name.lower().replace(" ", "-").replace("_", "-")
+        if not breeder_slug:
+            breeder_slug = "forum-import"
+
         result = {
             "name": strain.primary_name,
+            "strain_slug": strain_slug,
+            "breeder_slug": breeder_slug,
             "rsp": sample.rsp_number if sample else "",
             "complete": (sample.is_complete if sample else False) or has_observations,
             "description": original_desc,

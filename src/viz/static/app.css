@@ -786,3 +786,81 @@ body {
   padding: 12px 0;
 }
 
+/* ── Import Progress Card & Progress Bar ── */
+.import-progress-card {
+  background: var(--bg-card);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-lg);
+  backdrop-filter: blur(12px);
+  padding: 20px;
+  margin-bottom: 12px;
+  animation: cardIn 0.3s ease;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.import-progress-card h3 {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 2px;
+}
+
+.import-progress-status {
+  font-size: 12px;
+  color: var(--accent-cyan);
+  font-weight: 500;
+  min-height: 18px;
+  line-height: 1.4;
+}
+
+.import-progress-bar-wrap {
+  height: 8px;
+  background: var(--glass);
+  border-radius: 4px;
+  overflow: hidden;
+  position: relative;
+  border: 1px solid rgba(255, 255, 255, 0.03);
+}
+
+.import-progress-bar {
+  height: 100%;
+  width: 0%;
+  background: var(--gradient-genetic);
+  border-radius: 4px;
+  transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: 0 0 8px rgba(0, 210, 255, 0.5);
+  position: relative;
+}
+
+.import-progress-details {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 4px;
+  background: rgba(255, 255, 255, 0.02);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+}
+
+.progress-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.progress-stat .stat-label {
+  font-size: 10px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.progress-stat .stat-value {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+

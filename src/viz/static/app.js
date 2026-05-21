@@ -217,30 +217,142 @@
   }
 
   // ── Strain Detail Panel ──
-  async function loadStrainDetail(strainName, source, strainSlug, breederSlug, realName) {
+  async function loadStrainDetail(strainName, source, strainSlug, breederSlug, realName, force = false) {
     const panel = document.getElementById('strain-panel');
     panel.innerHTML = `<div class="empty-state"><div class="loading-spinner"></div><div>Loading...</div></div>`;
 
     try {
       let resp;
-      if (source === 'seedfinder' || source === 'forum') {
-        panel.innerHTML = `<div class="empty-state"><div class="loading-spinner"></div><div>Scraping & Aggregating details for ${realName}...</div></div>`;
+      const isImport = (source === 'seedfinder' || source === 'forum') || force;
+      if (isImport) {
+        const useSource = source || (breederSlug === 'forum-import' ? 'forum' : 'seedfinder');
+        const useRealName = realName || strainName;
+        const useStrainSlug = strainSlug || strainName.toLowerCase().replace(/ /g, '-').replace(/_/g, '-');
+        const useBreederSlug = breederSlug || 'forum-import';
+
+        panel.innerHTML = `
+          <div class="import-progress-card">
+            <h3>Importing ${useRealName}</h3>
+            <div class="import-progress-status" id="import-status">Initializing...</div>
+            <div class="import-progress-bar-wrap">
+              <div class="import-progress-bar" id="import-bar" style="width: 0%"></div>
+            </div>
+            <div class="import-progress-details">
+              <div class="progress-stat">
+                <span class="stat-label">Posts Collected</span>
+                <span class="stat-value" id="progress-posts-count">0</span>
+              </div>
+              <div class="progress-stat">
+                <span class="stat-label">Images Collected</span>
+                <span class="stat-value" id="progress-images-count">0</span>
+              </div>
+            </div>
+          </div>
+        `;
+
+        function estimateProgress(message) {
+          if (!message) return 0;
+          const msg = message.toLowerCase();
+          if (msg.includes("initializing")) return 5;
+          if (msg.includes("fetching metadata")) return 10;
+          if (msg.includes("scraping overgrow")) return 20;
+          if (msg.includes("overgrow complete") || msg.includes("scraping rollitup")) return 35;
+          if (msg.includes("rollitup thread")) {
+            const match = msg.match(/thread\s+(\d+)\/(\d+)/);
+            if (match) {
+              const current = parseInt(match[1]);
+              const total = parseInt(match[2]);
+              return 35 + Math.round((current / total) * 15);
+            }
+            return 45;
+          }
+          if (msg.includes("rollitup complete") || msg.includes("scraping thcfarmer")) return 50;
+          if (msg.includes("thcfarmer thread")) {
+            const match = msg.match(/thread\s+(\d+)\/(\d+)/);
+            if (match) {
+              const current = parseInt(match[1]);
+              const total = parseInt(match[2]);
+              return 50 + Math.round((current / total) * 15);
+            }
+            return 60;
+          }
+          if (msg.includes("thcfarmer complete") || msg.includes("scraping icmag")) return 65;
+          if (msg.includes("icmag thread")) {
+            const match = msg.match(/thread\s+(\d+)\/(\d+)/);
+            if (match) {
+              const current = parseInt(match[1]);
+              const total = parseInt(match[2]);
+              return 65 + Math.round((current / total) * 20);
+            }
+            return 75;
+          }
+          return 90;
+        }
+
         resp = await fetch('/api/strains/import', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ strain_slug: strainSlug, breeder_slug: breederSlug })
+          body: JSON.stringify({ strain_slug: useStrainSlug, breeder_slug: useBreederSlug, force: force })
         });
-      } else {
-        resp = await fetch(`/api/strains/${encodeURIComponent(strainName)}/detail`);
-      }
-      if (!resp.ok) throw new Error('Not found');
-      const d = await resp.json();
-      panel.innerHTML = renderStrainCard(d);
-      if (typeof renderLineageTree === 'function') {
-        renderLineageTree(d.name, d.lineage);
-      }
 
-      if (source === 'seedfinder' || source === 'forum') {
+        if (!resp.ok) {
+          throw new Error('Failed to start import');
+        }
+
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder("utf-8");
+        let buffer = "";
+        let finalData = null;
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop();
+
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            try {
+              const packet = JSON.parse(line);
+              if (packet.type === 'progress') {
+                const statusEl = document.getElementById('import-status');
+                const barEl = document.getElementById('import-bar');
+                const postsEl = document.getElementById('progress-posts-count');
+                const imagesEl = document.getElementById('progress-images-count');
+                
+                if (statusEl) statusEl.textContent = packet.message;
+                if (postsEl) postsEl.textContent = packet.posts || 0;
+                if (imagesEl) imagesEl.textContent = packet.images || 0;
+                
+                if (barEl) {
+                  const pct = estimateProgress(packet.message);
+                  barEl.style.width = `${pct}%`;
+                }
+              } else if (packet.type === 'done') {
+                finalData = packet.data;
+              } else if (packet.type === 'error') {
+                throw new Error(packet.error || 'Import failed');
+              }
+            } catch (err) {
+              console.error('Failed to parse NDJSON line:', err);
+              if (err.message.includes('Import failed') || err.message.includes('Failed to start import')) {
+                throw err;
+              }
+            }
+          }
+        }
+
+        if (!finalData) {
+          throw new Error('Import did not complete successfully');
+        }
+
+        // Render final strain card
+        panel.innerHTML = renderStrainCard(finalData);
+        if (typeof renderLineageTree === 'function') {
+          renderLineageTree(finalData.name, finalData.lineage);
+        }
+
         // Trigger a reload of network data so the newly imported strain node appears in the visualization
         try {
           const ndResp = await fetch('/api/network-data');
@@ -253,7 +365,7 @@
             if (state.currentView === 'network') {
               buildGraph();
               // Try to select the node
-              const targetNodeId = d.name;
+              const targetNodeId = finalData.name;
               if (state.nodes && state.network) {
                 state.network.selectNodes([targetNodeId]);
                 state.network.focus(targetNodeId, { scale: 1.5, animation: true });
@@ -262,6 +374,15 @@
           }
         } catch (ndErr) {
           console.error('Failed to update network graph:', ndErr);
+        }
+
+      } else {
+        resp = await fetch(`/api/strains/${encodeURIComponent(strainName)}/detail`);
+        if (!resp.ok) throw new Error('Not found');
+        const d = await resp.json();
+        panel.innerHTML = renderStrainCard(d);
+        if (typeof renderLineageTree === 'function') {
+          renderLineageTree(d.name, d.lineage);
         }
       }
     } catch (err) {
@@ -278,7 +399,14 @@
 
   function renderStrainCard(d) {
     let html = `<div class="strain-card">
-      <h2>${(d.name || '').replace(/_/g, ' ')}</h2>
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; gap: 10px; flex-wrap: wrap;">
+        <h2 style="margin:0">${(d.name || '').replace(/_/g, ' ')}</h2>
+        ${d.strain_slug && d.breeder_slug ? `
+          <button class="rescraped-btn" data-strain-slug="${escapeHtml(d.strain_slug)}" data-breeder-slug="${escapeHtml(d.breeder_slug)}" data-real-name="${escapeHtml(d.name)}" style="background:rgba(0, 242, 254, 0.1); border:1px solid var(--accent-cyan); color:var(--accent-cyan); padding:4px 8px; border-radius:4px; font-size:11px; cursor:pointer; font-weight:600; transition:all 0.2s;">
+            🔄 Re-scrape & Reset Cache
+          </button>
+        ` : ''}
+      </div>
       ${d.rsp ? `<span class="rsp-badge">${d.rsp}</span>` : ''}`;
 
     // Strain-level info (breeder, type, description) — always available
@@ -530,6 +658,15 @@
 
     // Click delegation for neighbor items and expand buttons
     document.getElementById('strain-panel').addEventListener('click', e => {
+      const rescrapeBtn = e.target.closest('.rescraped-btn');
+      if (rescrapeBtn) {
+        const strainSlug = rescrapeBtn.dataset.strainSlug;
+        const breederSlug = rescrapeBtn.dataset.breederSlug;
+        const realName = rescrapeBtn.dataset.realName;
+        loadStrainDetail(realName, breederSlug === 'forum-import' ? 'forum' : 'seedfinder', strainSlug, breederSlug, realName, true);
+        return;
+      }
+
       const item = e.target.closest('.neighbor-item');
       if (item) {
         const name = item.dataset.strain;
