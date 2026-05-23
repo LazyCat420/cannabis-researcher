@@ -1318,7 +1318,7 @@
     treeWrapper.style.position = 'relative';
     
     const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-    svg.className = 'tree-svg-overlay';
+    svg.setAttribute('class', 'tree-svg-overlay');
     svg.style.position = 'absolute';
     svg.style.top = '0';
     svg.style.left = '0';
