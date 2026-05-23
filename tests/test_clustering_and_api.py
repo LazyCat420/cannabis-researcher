@@ -61,7 +61,7 @@ async def test_ingest_clustering_and_detail_api():
         # 3. Add mock forum observation with images linked to Jack Herer
         async for session in get_session():
             # Find canonical strain
-            stmt = select(CanonicalStrainORM).where(CanonicalStrainORM.primary_name == "Jack Herer")
+            stmt = select(CanonicalStrainORM).where(CanonicalStrainORM.id == data["strain_id"])
             strain = (await session.execute(stmt)).scalars().first()
             assert strain is not None
             
@@ -152,14 +152,16 @@ async def test_ingest_clustering_and_detail_api():
                     
                 await session.delete(sample)
                 
-            stmt_strain = select(CanonicalStrainORM).where(CanonicalStrainORM.primary_name == "Jack Herer").options(
+            stmt_strain = select(CanonicalStrainORM).where(CanonicalStrainORM.id == data["strain_id"]).options(
                 selectinload(CanonicalStrainORM.aliases)
             )
             strain = (await session.execute(stmt_strain)).scalars().first()
             if strain:
-                for alias in strain.aliases:
-                    await session.delete(alias)
-                await session.delete(strain)
+                for alias in list(strain.aliases):
+                    if alias.source_id == "RSP420":
+                        await session.delete(alias)
+                if strain.primary_name == "Jack Herer":
+                    await session.delete(strain)
                 
             await session.commit()
             break

@@ -14,118 +14,146 @@ from sklearn.cluster import KMeans
 
 logger = logging.getLogger(__name__)
 
-# Check for CLIP / Pillow dependencies
+# Check for Pillow and HTTPX dependencies
 HAS_ML_LIBRARIES = False
 try:
     from PIL import Image
-    import torch
-    from transformers import CLIPProcessor, CLIPModel
     import httpx
+    import base64
+    import asyncio
     HAS_ML_LIBRARIES = True
 except ImportError:
     HAS_ML_LIBRARIES = False
 
-# Global CLIP Model Cache
-_clip_model = None
-_clip_processor = None
-
-def get_clip_resources():
-    """Load CLIP model and processor lazily to avoid startup delays."""
-    global _clip_model, _clip_processor
-    if not HAS_ML_LIBRARIES:
-        return None, None
-    if _clip_model is None:
-        try:
-            logger.info("Initializing lightweight CLIP model...")
-            # Use smallest standard CLIP model
-            model_name = "openai/clip-vit-base-patch32"
-            _clip_processor = CLIPProcessor.from_pretrained(model_name)
-            _clip_model = CLIPModel.from_pretrained(model_name)
-            logger.info("CLIP model loaded successfully.")
-        except Exception as e:
-            logger.error(f"Failed to load CLIP model: {e}")
-    return _clip_model, _clip_processor
+def get_vllm_endpoints() -> dict[str, str]:
+    """Retrieve Jetson and DGX Spark VLLM URLs from vault env or defaults."""
+    import os
+    from pathlib import Path
+    
+    endpoints = {
+        "JETSON_VLLM_URL": os.getenv("JETSON_VLLM_URL", "http://10.0.0.30:8000"),
+        "DGX_SPARK_VLLM_URL": os.getenv("DGX_SPARK_VLLM_URL", "http://10.0.0.141:8000")
+    }
+    
+    # Locate vault-service/.env to read URLs dynamically
+    curr = Path(__file__).resolve()
+    for parent in curr.parents:
+        vault_env = parent / "vault-service" / ".env"
+        if vault_env.exists():
+            try:
+                with open(vault_env, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if "=" in line:
+                            k, v = line.split("=", 1)
+                            k = k.strip()
+                            v = v.strip().strip('"').strip("'")
+                            if k in ["JETSON_VLLM_URL", "DGX_SPARK_VLLM_URL"]:
+                                endpoints[k] = v
+                break
+            except Exception as e:
+                logger.warning(f"Failed to parse vault .env: {e}")
+                
+    return endpoints
 
 async def is_budding_plant_image(image_url: str) -> bool:
-    """Download image and use CLIP zero-shot classification to verify if it depicts a budding plant."""
+    """Download image and use remote vision model on Jetson/DGX Spark to verify if it depicts a budding plant."""
     if not HAS_ML_LIBRARIES:
-        # Default to True if ML libraries are missing so it doesn't break basic functionality
         return True
     try:
-        model, processor = get_clip_resources()
-        if not model or not processor:
-            return True
-            
+        from io import BytesIO
+        
+        # 1. Download the image
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(image_url)
             if resp.status_code != 200:
-                logger.warning(f"Failed to download image for ML classification from {image_url}: status {resp.status_code}")
-                return False
+                logger.warning(f"Failed to download image for VLM classification from {image_url}: status {resp.status_code}")
+                return True  # Fallback to saving it
             
-            from io import BytesIO
+            # 2. Resize image to max 512x512 using Pillow to optimize bandwidth/VRAM/speed
             img = Image.open(BytesIO(resp.content)).convert("RGB")
+            img.thumbnail((512, 512))
             
-            # Target (positive) vs Negative prompts
-            candidate_labels = [
-                "a budding cannabis plant",
-                "a close-up of a cannabis bud",
-                "marijuana flower in bloom",
-                "a product label",
-                "seedlings",
-                "empty rooms",
-                "text"
-            ]
+            # 3. Convert image to base64
+            buffered = BytesIO()
+            img.save(buffered, format="JPEG", quality=85)
+            img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+            b64_img = f"data:image/jpeg;base64,{img_str}"
             
-            # Process image and text prompts
-            inputs = processor(
-                text=candidate_labels,
-                images=img,
-                return_tensors="pt",
-                padding=True
-            )
-            
-            with torch.no_grad():
-                outputs = model(**inputs)
-                logits_per_image = outputs.logits_per_image # image-text similarity scores
-                probs = logits_per_image.softmax(dim=1).cpu().numpy()[0]
+        # 4. Prepare payload for vLLM vision model
+        endpoints = get_vllm_endpoints()
+        prompt = "Does this image depict a budding cannabis plant or a close-up of a cannabis flower/bud? Answer only Yes or No."
+        
+        # Attempt Jetson first, then fallback to DGX Spark
+        urls_to_try = [
+            ("Jetson", endpoints["JETSON_VLLM_URL"], "cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit"),
+            ("DGX Spark", endpoints["DGX_SPARK_VLLM_URL"], "Qwen/Qwen3.5-122B-A10B-FP8")
+        ]
+        
+        for name, base_url, model in urls_to_try:
+            url = f"{base_url.rstrip('/')}/v1/chat/completions"
+            payload = {
+                "model": model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": b64_img}},
+                            {"type": "text", "text": prompt}
+                        ]
+                    }
+                ],
+                "max_tokens": 512,
+                "temperature": 0.0
+            }
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    r = await client.post(url, json=payload)
+                    if r.status_code == 200:
+                        data = r.json()
+                        content = data["choices"][0]["message"]["content"]
+                        if content:
+                            content_lower = content.lower().strip()
+                            logger.info(f"VLM classification from {name} for {image_url}: {content_lower.replace('\n', ' ')}")
+                            if "yes" in content_lower:
+                                return True
+                            elif "no" in content_lower:
+                                return False
+                            # Fallback if answer is ambiguous but successful response
+                            return True
+            except Exception as e:
+                logger.warning(f"VLM classification failed on {name} ({url}): {e}")
                 
-            # Combine positive probabilities (first three labels)
-            positive_score = float(probs[0] + probs[1] + probs[2])
-            logger.info(f"Image {image_url} classification: positive_score={positive_score:.4f} (probs: {probs})")
-            
-            return positive_score >= 0.45
+        # If both endpoints fail, default to True so we don't drop images
+        logger.warning(f"All VLM endpoints failed or timed out for {image_url}. Defaulting to True.")
+        return True
             
     except Exception as e:
-        logger.warning(f"Budding plant classification failed for {image_url}: {e}")
-        return False
+        logger.warning(f"VLM pipeline failed for {image_url}: {e}")
+        return True
+
+async def classify_images_batch(urls: list[str], batch_size: int = 15) -> dict[str, bool]:
+    """Classify a list of image URLs concurrently in batches using a Semaphore."""
+    if not urls:
+        return {}
+    
+    sem = asyncio.Semaphore(batch_size)
+    
+    async def worker(url: str):
+        async with sem:
+            res = await is_budding_plant_image(url)
+            return url, res
+            
+    tasks = [worker(url) for url in urls]
+    results = await asyncio.gather(*tasks)
+    return dict(results)
 
 async def extract_image_embedding(image_url: str) -> list[float]:
-    """Download image and extract feature vector (CLIP or color histogram fallback)."""
+    """Download image and extract feature vector (color histogram fallback)."""
     if HAS_ML_LIBRARIES:
-        try:
-            model, processor = get_clip_resources()
-            if model and processor:
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    resp = await client.get(image_url)
-                    if resp.status_code == 200:
-                        from io import BytesIO
-                        img = Image.open(BytesIO(resp.content)).convert("RGB")
-                        
-                        # Generate CLIP features
-                        inputs = processor(images=img, return_tensors="pt")
-                        with torch.no_grad():
-                            image_features = model.get_image_features(**inputs)
-                        
-                        # Normalize and return
-                        feats = image_features[0].cpu().numpy()
-                        norm = np.linalg.norm(feats)
-                        if norm > 0:
-                            feats = feats / norm
-                        return feats.tolist()
-        except Exception as e:
-            logger.warning(f"CLIP feature extraction failed for {image_url}: {e}")
-            
-        # Fallback to local image processing (color histogram) if download succeeded but CLIP failed
+        # Fallback to local image processing (color histogram)
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.get(image_url)
@@ -134,7 +162,7 @@ async def extract_image_embedding(image_url: str) -> list[float]:
                     img = Image.open(BytesIO(resp.content)).convert("RGB")
                     img = img.resize((64, 64))
                     hist = img.histogram() # RGB components (768 elements)
-                    arr = np.array(hist, dtype=float)
+                    arr = np.interp(np.linspace(0, len(hist) - 1, 512), np.arange(len(hist)), hist)
                     norm = np.linalg.norm(arr)
                     if norm > 0:
                         arr = arr / norm
@@ -185,7 +213,20 @@ async def run_image_clustering(session) -> int:
         await session.commit()
         return len(images)
         
-    X = np.array([img.embedding for img in all_images])
+    embeddings = []
+    for img in all_images:
+        emb = img.embedding
+        if len(emb) != 512:
+            emb_arr = np.array(emb, dtype=float)
+            emb_arr = np.interp(np.linspace(0, len(emb) - 1, 512), np.arange(len(emb)), emb_arr)
+            norm = np.linalg.norm(emb_arr)
+            if norm > 0:
+                emb_arr = emb_arr / norm
+            emb = emb_arr.tolist()
+            img.embedding = emb
+        embeddings.append(emb)
+        
+    X = np.array(embeddings)
     n_clusters = max(2, min(len(X) // 2, 15))
     
     kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)

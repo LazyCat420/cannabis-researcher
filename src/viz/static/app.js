@@ -399,6 +399,7 @@
       }
     } catch (err) {
       // Fallback for strains with no sample data
+      console.error('loadStrainDetail error:', err);
       const node = state.nodes ? state.nodes.get(strainName) : null;
       panel.innerHTML = renderBasicCard(strainName, node);
       if (typeof renderLineageTree === 'function') {

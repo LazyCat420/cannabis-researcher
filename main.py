@@ -11,7 +11,7 @@ Main application entry point. Provides:
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -52,6 +52,67 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+async def get_canonical_strain_name(session, name: str) -> Optional[str]:
+    """Resolve any case, punctuation, or alias variation of a strain name to its canonical primary name in the database."""
+    if not name:
+        return None
+        
+    # 1. Case-insensitive exact match
+    stmt = select(CanonicalStrainORM.primary_name).where(CanonicalStrainORM.primary_name.ilike(name))
+    res = (await session.execute(stmt)).scalar()
+    if res:
+        return res
+        
+    # 2. Case and punctuation-insensitive match
+    import re
+    norm = re.sub(r"[^a-z0-9]", "", name.lower())
+    stmt2 = select(CanonicalStrainORM.primary_name).where(
+        func.replace(func.replace(func.replace(func.lower(CanonicalStrainORM.primary_name), "_", ""), "-", ""), " ", "") == norm
+    )
+    res = (await session.execute(stmt2)).scalar()
+    if res:
+        return res
+        
+    # 3. Check aliases
+    stmt_alias = select(CanonicalStrainORM.primary_name).join(
+        StrainAliasORM, CanonicalStrainORM.id == StrainAliasORM.canonical_strain_id
+    ).where(
+        or_(
+            StrainAliasORM.name.ilike(name),
+            func.replace(func.replace(func.replace(func.lower(StrainAliasORM.name), "_", ""), "-", ""), " ", "") == norm
+        )
+    )
+    res = (await session.execute(stmt_alias)).scalar()
+    if res:
+        return res
+        
+    return None
+
+
+def clean_forum_image_url(url: str) -> str:
+    """Extract direct image URL from XenForo/Rollitup proxy.php wrapper URLs if present."""
+    if not url:
+        return ""
+    if "proxy.php?image=" in url or "/proxy.php?image=" in url:
+        try:
+            import urllib.parse
+            import re
+            parsed = urllib.parse.urlparse(url)
+            query = urllib.parse.parse_qs(parsed.query)
+            image_param = query.get("image")
+            if image_param:
+                return image_param[0]
+        except Exception:
+            import urllib.parse
+            import re
+            # Fallback regex if URL parsing fails
+            match = re.search(r'[?&]image=([^&]+)', url)
+            if match:
+                return urllib.parse.unquote(match.group(1))
+    return url
+
+
 async def save_domain_models_to_db(session, result: dict):
     """Save resolved Kannapedia domain objects to Postgres."""
     # 1. Save / Update CanonicalStrain
@@ -86,10 +147,11 @@ async def save_domain_models_to_db(session, result: dict):
     # 2. Save GenomicSample
     sample_domain = result["sample"]
     # Check if sample exists
-    stmt_sample = select(GenomicSampleORM).where(GenomicSampleORM.rsp_number == sample_domain.rsp_number)
-    existing_sample = (await session.execute(stmt_sample)).scalars().first()
-    if existing_sample:
-        return
+    if sample_domain.rsp_number:
+        stmt_sample = select(GenomicSampleORM).where(GenomicSampleORM.rsp_number == sample_domain.rsp_number)
+        existing_sample = (await session.execute(stmt_sample)).scalars().first()
+        if existing_sample:
+            return
         
     sample_orm = GenomicSampleORM(
         id=sample_domain.id,
@@ -683,9 +745,14 @@ def _is_post_relevant(body: str, title: str, strain_name: str) -> bool:
 
 async def _save_forum_posts_to_db(session, posts: list[dict], source_name: str, canonical_id: str, reported_strain: str) -> tuple[int, int]:
     from datetime import datetime
-    from src.ml.clustering import is_budding_plant_image
+    from src.ml.clustering import classify_images_batch
     posts_saved = 0
     images_saved = 0
+
+    # 1. Identify posts to be saved and gather all their image URLs
+    valid_posts = []
+    all_image_urls = []
+    
     for p in posts:
         # Check if exists
         stmt = select(ObservationORM).where(ObservationORM.source_id == str(p.get("id")))
@@ -696,10 +763,32 @@ async def _save_forum_posts_to_db(session, posts: list[dict], source_name: str, 
         title = p.get("title", "")
         body = p.get("body", "")
 
-        # Check relevance
-        if not _is_post_relevant(body, title, reported_strain):
+        # Check relevance — skip filter for OP posts (post_number == 1)
+        # ONLY if the thread title itself contains the strain name. Otherwise,
+        # the OP post must be checked for relevance just like other posts.
+        post_number = p.get("post_number")
+        is_op = post_number == 1
+        title_relevant = _is_post_relevant("", title, reported_strain)
+        
+        if not (is_op and title_relevant) and not _is_post_relevant(body, title, reported_strain):
             continue
 
+        valid_posts.append(p)
+        for url in p.get("image_urls", []):
+            cleaned_url = clean_forum_image_url(url)
+            if cleaned_url not in all_image_urls:
+                all_image_urls.append(cleaned_url)
+
+    # 2. Concurrently classify all unique image URLs in parallel batches (15 at a time)
+    classified_results = {}
+    if all_image_urls:
+        logger.info(f"Concurrently classifying {len(all_image_urls)} image URLs for {reported_strain} ({source_name})...")
+        classified_results = await classify_images_batch(all_image_urls, batch_size=15)
+
+    # 3. Create observation records and save images that depict budding plants
+    for p in valid_posts:
+        title = p.get("title", "")
+        body = p.get("body", "")
         created_at_str = p.get("created_at")
         dt = datetime.fromisoformat(created_at_str).replace(tzinfo=None) if created_at_str else datetime.utcnow()
 
@@ -717,13 +806,12 @@ async def _save_forum_posts_to_db(session, posts: list[dict], source_name: str, 
         await session.flush()
         posts_saved += 1
 
-        # Save associated images (only if they are classified as budding plants)
-        image_urls = p.get("image_urls", [])
-        for url in image_urls:
-            if await is_budding_plant_image(url):
+        for url in p.get("image_urls", []):
+            cleaned_url = clean_forum_image_url(url)
+            if classified_results.get(cleaned_url, True):  # Default to True on failure
                 img_orm = ObservationImageORM(
                     observation_id=obs.id,
-                    image_url=url
+                    image_url=cleaned_url
                 )
                 session.add(img_orm)
                 images_saved += 1
@@ -731,12 +819,120 @@ async def _save_forum_posts_to_db(session, posts: list[dict], source_name: str, 
     return posts_saved, images_saved
 
 
+def parse_genetics_from_snippets(snippets: list[str], strain_name: str) -> list[str]:
+    import re
+    # Normalize strain name
+    name_norm = re.sub(r'[^a-zA-Z0-9]', '', strain_name.lower())
+    
+    # Try different regex strategies across all snippets
+    for snip in snippets:
+        snip_clean = snip.replace('\xa0', ' ').replace('\u200e', '')
+        
+        # Strategy 1: Look for "StrainName »»» Parent1 x Parent2"
+        match = re.search(r'»»»\s*([^·\n]+)', snip_clean)
+        if match:
+            cross_text = match.group(1).strip()
+            if any(x in cross_text.lower() for x in [' x ', '×', ' x']):
+                parts = re.split(r'\s+[xX×]\s+|\s+x\s+|_x_|_X_', cross_text)
+                parents = [p.strip() for p in parts if p.strip()]
+                parents = [p for p in parents if len(p) > 2 and p.lower() not in ["mostly indica", "mostly sativa", "hybrid"]]
+                if len(parents) >= 2:
+                    return parents
+                    
+        # Strategy 2: Look for "Genetic:Parent1 x Parent2"
+        match_genetic = re.search(r'Genetic\s*:\s*([^.\n]+)', snip_clean, re.IGNORECASE)
+        if match_genetic:
+            cross_text = match_genetic.group(1).strip()
+            cross_text = re.split(r'flowering|characteristics|strong|medicinal', cross_text, flags=re.IGNORECASE)[0].strip()
+            if any(x in cross_text.lower() for x in [' x ', '×', ' x']):
+                parts = re.split(r'\s+[xX×]\s+|\s+x\s+|_x_|_X_', cross_text)
+                parents = [p.strip() for p in parts if p.strip()]
+                parents = [p for p in parents if len(p) > 2 and p.lower() not in ["mostly indica", "mostly sativa", "hybrid"]]
+                if len(parents) >= 2:
+                    return parents
+                    
+        # Strategy 3: Heuristic for Capitalized Words separated by 'x'
+        for match in re.finditer(r'([A-Z][a-zA-Z0-9\s\']+)\s+[xX×*]\s+([A-Z][a-zA-Z0-9\s\']+)(?:\s+[xX×*]\s+([A-Z][a-zA-Z0-9\s\']+))?', snip_clean):
+            parents = [p.strip() for p in match.groups() if p]
+            parents = [p for p in parents if len(p) > 2 and p.lower() not in ["mostly indica", "mostly sativa", "hybrid"] and len(p) < 40]
+            if len(parents) >= 2:
+                return parents
+
+    return []
+
+
+async def fallback_search_genetics(strain_name: str) -> list[str]:
+    import os
+    import sys
+    import json
+    import asyncio
+    
+    # Candidate python paths with ddgs installed
+    candidates = [
+        "/home/lazycat/github/rods-project/sun/scraper-service/.venv/bin/python",
+        "/home/lazycat/github/rods-project/sun/scraper-service/venv/bin/python",
+        "/home/lazycat/github/rods-project/sun/trading-service/.venv/bin/python",
+    ]
+    
+    python_exe = None
+    for c in candidates:
+        if os.path.exists(c):
+            python_exe = c
+            break
+            
+    if not python_exe:
+        python_exe = sys.executable
+
+    # Query DuckDuckGo
+    query = f'site:seedfinder.eu "{strain_name}"'
+    script = """
+import sys
+import json
+try:
+    from ddgs import DDGS
+    with DDGS() as ddgs:
+        results = list(ddgs.text(sys.argv[1], max_results=10))
+    print(json.dumps({"success": True, "results": results}))
+except Exception as e:
+    print(json.dumps({"success": False, "error": str(e)}))
+"""
+    
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            python_exe, "-c", script, query,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode == 0:
+            data = json.loads(stdout.decode().strip())
+            if data.get("success"):
+                snippets = [r.get("body", "") for r in data.get("results", []) if r.get("body")]
+                return parse_genetics_from_snippets(snippets, strain_name)
+            else:
+                logger.error(f"DDG fallback search execution error: {data.get('error')}")
+        else:
+            logger.error(f"DDG fallback search process failed with code {proc.returncode}: {stderr.decode()}")
+    except Exception as e:
+        logger.error(f"Failed to execute DDG fallback search: {e}")
+        
+    return []
+
+
 @app.post("/api/strains/import")
 async def import_strain(request: Request):
     payload = await request.json()
     strain_slug = payload.get("strain_slug")
     breeder_slug = payload.get("breeder_slug")
+    real_name = payload.get("real_name")  # Passed by SeedFinder search results
     force = payload.get("force", False)
+    query = payload.get("query")
+
+    if query and not strain_slug:
+        strain_slug = query
+    if query and not breeder_slug:
+        breeder_slug = "free-text"
+
     if not strain_slug or not breeder_slug:
         return JSONResponse({"error": "Missing strain_slug or breeder_slug"}, status_code=400)
 
@@ -750,7 +946,91 @@ async def import_strain(request: Request):
         yield json.dumps({"type": "progress", "message": "Initializing...", "posts": 0, "images": 0}) + "\n"
 
         async for session in get_session():
-            # Check if already imported
+            nonlocal strain_slug, breeder_slug, real_name
+            
+            # If free-text search or query parameter is present, resolve it first
+            if breeder_slug == "free-text" or query:
+                lookup_name = query or strain_slug
+                resolved_name = await get_canonical_strain_name(session, lookup_name)
+                if resolved_name:
+                    # Found in DB! Let's get the CanonicalStrainORM
+                    stmt_cs = select(CanonicalStrainORM).where(CanonicalStrainORM.primary_name == resolved_name)
+                    strain_orm = (await session.execute(stmt_cs)).scalars().first()
+                    if strain_orm:
+                        # Check if it has any observations or genomic sample
+                        stmt_sample = select(GenomicSampleORM).where(GenomicSampleORM.canonical_strain_id == strain_orm.id)
+                        has_sample = (await session.execute(stmt_sample)).scalars().first() is not None
+                        has_data = (strain_orm.observation_count and strain_orm.observation_count > 0) or has_sample
+                        
+                        if has_data and not force:
+                            logger.info(f"Free-text search '{lookup_name}' resolved to existing DB strain '{resolved_name}' with data. Returning directly.")
+                            detail_data = await strain_detail(strain_orm.primary_name)
+                            yield json.dumps({"type": "done", "data": detail_data}) + "\n"
+                            return
+                        else:
+                            # Needs enrichment. Align slugs and names with this strain
+                            logger.info(f"Free-text search '{lookup_name}' resolved to '{resolved_name}' but needs enrichment (force={force}, has_data={has_data})")
+                            primary_name = strain_orm.primary_name
+                            real_name = primary_name
+                            strain_slug = primary_name.lower().replace("_", "-")
+                            # Eagerly load the breeder name
+                            from src.models.orm import BreederORM
+                            stmt_br = select(BreederORM).where(BreederORM.id == strain_orm.breeder_id)
+                            br = (await session.execute(stmt_br)).scalars().first() if strain_orm.breeder_id else None
+                            
+                            # Check aliases for a real seedfinder breeder slug
+                            stmt_aliases = select(StrainAliasORM).where(StrainAliasORM.canonical_strain_id == strain_orm.id)
+                            aliases = (await session.execute(stmt_aliases)).scalars().all()
+                            found_breeder_slug = None
+                            for a in aliases:
+                                if a.source_name == "seedfinder" and a.source_id and ":" in a.source_id:
+                                    parts = a.source_id.split(":", 1)
+                                    if len(parts) > 1 and parts[1] != "seedfinder" and parts[1] != "forum-import":
+                                        found_breeder_slug = parts[1]
+                                        break
+                                        
+                            if found_breeder_slug:
+                                breeder_slug = found_breeder_slug
+                            elif br and br.name and br.name.lower() not in ("unknown", "unknown breeder", "seedfinder"):
+                                breeder_slug = br.name.lower().replace(" ", "-").replace("'", "").replace("’", "").replace(".", "")
+                            else:
+                                breeder_slug = "forum-import"
+                            if force:
+                                from sqlalchemy import delete
+                                obs_stmt = select(ObservationORM.id).where(ObservationORM.canonical_strain_id == strain_orm.id)
+                                obs_ids = (await session.execute(obs_stmt)).scalars().all()
+                                if obs_ids:
+                                    await session.execute(delete(ObservationImageORM).where(ObservationImageORM.observation_id.in_(obs_ids)))
+                                    await session.execute(delete(ObservationORM).where(ObservationORM.id.in_(obs_ids)))
+                                strain_orm.observation_count = 0
+                                await session.flush()
+                else:
+                    # Not found in DB! Let's query SeedFinder for matches
+                    logger.info(f"Free-text search '{lookup_name}' not found in DB. Searching SeedFinder...")
+                    yield json.dumps({"type": "progress", "message": f"Searching SeedFinder for '{lookup_name}'...", "posts": 0, "images": 0}) + "\n"
+                    
+                    from src.collectors.seedfinder_collector import search_seedfinder
+                    try:
+                        sf_results = await search_seedfinder(lookup_name, limit=5)
+                    except Exception as e:
+                        logger.error(f"SeedFinder search failed in free-text flow for '{lookup_name}': {e}")
+                        sf_results = []
+                        
+                    if sf_results:
+                        best_match = sf_results[0]
+                        strain_slug = best_match["strain_slug"]
+                        breeder_slug = best_match["breeder_slug"]
+                        real_name = best_match["name"]
+                        logger.info(f"Free-text search '{lookup_name}' matched SeedFinder strain '{real_name}' ({breeder_slug})")
+                        yield json.dumps({"type": "progress", "message": f"Found match on SeedFinder: '{real_name}' by '{breeder_slug}'", "posts": 0, "images": 0}) + "\n"
+                    else:
+                        logger.info(f"Free-text search '{lookup_name}' had no SeedFinder matches. Falling back to Forum Import.")
+                        strain_slug = lookup_name.lower().replace(" ", "-")
+                        breeder_slug = "forum-import"
+                        real_name = lookup_name
+                        yield json.dumps({"type": "progress", "message": f"No SeedFinder match. Falling back to Forum Import for '{lookup_name}'...", "posts": 0, "images": 0}) + "\n"
+
+            # ── Step 1: Check if already imported via alias ──
             alias_source_name = "forum" if breeder_slug == "forum-import" else "seedfinder"
             stmt_alias = select(StrainAliasORM).where(
                 (StrainAliasORM.source_name == alias_source_name) & 
@@ -765,7 +1045,7 @@ async def import_strain(request: Request):
                     yield json.dumps({"type": "done", "data": detail_data}) + "\n"
                     return
                 
-                # If force=True, we proceed and clean up existing observations and aliases
+                # If force=True, clean up existing observations and re-scrape
                 if force:
                     if strain_orm:
                         from sqlalchemy import delete
@@ -774,20 +1054,32 @@ async def import_strain(request: Request):
                         if obs_ids:
                             await session.execute(delete(ObservationImageORM).where(ObservationImageORM.observation_id.in_(obs_ids)))
                             await session.execute(delete(ObservationORM).where(ObservationORM.id.in_(obs_ids)))
-                        # Reset strain attributes (will be populated below)
-                        strain_orm.description = None
-                        strain_orm.lineage = {}
-                        strain_orm.strain_type = None
-                        strain_orm.avg_flowering_days = None
                         strain_orm.observation_count = 0
                         await session.flush()
                     await session.delete(alias)
                     await session.flush()
 
+            # ── Step 2: Check if strain already exists in DB by name ──
+            # This handles CSV-bootstrapped strains and previously imported ones
+            search_name = real_name or strain_slug.replace("-", " ").replace("_", " ")
+            search_name_underscore = search_name.replace(" ", "_")
+            stmt_existing = select(CanonicalStrainORM).where(
+                or_(
+                    CanonicalStrainORM.primary_name.ilike(search_name),
+                    CanonicalStrainORM.primary_name.ilike(search_name_underscore),
+                    CanonicalStrainORM.primary_name.ilike(search_name.replace(" ", "")),
+                )
+            )
+            existing_strain = (await session.execute(stmt_existing)).scalars().first()
+
             yield json.dumps({"type": "progress", "message": "Fetching metadata...", "posts": 0, "images": 0}) + "\n"
 
+            strain_orm = None
+            primary_name = None
+            sf_data = None
+
             if breeder_slug == "forum-import":
-                primary_name = strain_slug.replace("-", " ").title()
+                primary_name = search_name.title()
                 sf_data = {
                     "name": primary_name,
                     "breeder": "Unknown Breeder",
@@ -796,53 +1088,86 @@ async def import_strain(request: Request):
                     "description": f"Imported from forum discussions for {primary_name}.",
                     "lineage": {},
                 }
+            elif existing_strain and not force:
+                # Strain exists in DB — use it directly, skip SeedFinder scrape
+                strain_orm = existing_strain
+                primary_name = strain_orm.primary_name
+                logger.info(f"Found existing strain in DB: {primary_name} (id={strain_orm.id})")
+                yield json.dumps({"type": "progress", "message": f"Found {primary_name} in database, enriching with forum data...", "posts": 0, "images": 0}) + "\n"
             else:
-                # Scrape from SeedFinder
+                # Try SeedFinder scrape
                 from src.collectors.seedfinder_collector import scrape_seedfinder_strain
                 sf_data = await scrape_seedfinder_strain(strain_slug, breeder_slug)
                 if not sf_data or not sf_data.get("name"):
-                    yield json.dumps({"type": "error", "error": "Strain detail not found on SeedFinder"}) + "\n"
-                    return
+                    # SeedFinder failed (404, etc.) — fall back to creating strain from name
+                    logger.warning(f"SeedFinder returned no data for {strain_slug}/{breeder_slug}, using name fallback")
+                    primary_name = search_name.replace("-", " ").title()
+                    sf_data = {
+                        "name": primary_name,
+                        "breeder": breeder_slug.replace("-", " ").title() if breeder_slug != "seedfinder" else "Unknown Breeder",
+                        "type": None,
+                        "flowering_time_days": None,
+                        "description": None,
+                        "lineage": {},
+                    }
+                    yield json.dumps({"type": "progress", "message": f"Querying DuckDuckGo fallback for {primary_name} lineage...", "posts": 0, "images": 0}) + "\n"
+                    parsed_parents = await fallback_search_genetics(primary_name)
+                    if parsed_parents:
+                        logger.info(f"DuckDuckGo fallback successfully parsed parents for {primary_name}: {parsed_parents}")
+                        sf_data["lineage"] = [{"name": p} for p in parsed_parents]
+                elif not sf_data.get("lineage"):
+                    primary_name = sf_data["name"]
+                    yield json.dumps({"type": "progress", "message": f"Querying DuckDuckGo fallback for {primary_name} lineage...", "posts": 0, "images": 0}) + "\n"
+                    parsed_parents = await fallback_search_genetics(primary_name)
+                    if parsed_parents:
+                        logger.info(f"DuckDuckGo fallback successfully parsed parents for {primary_name}: {parsed_parents}")
+                        sf_data["lineage"] = [{"name": p} for p in parsed_parents]
 
-            # Create breeder if not exists
-            breeder_name = sf_data.get("breeder") or breeder_slug.replace("-", " ").title()
-            stmt_breeder = select(BreederORM).where(BreederORM.name.ilike(breeder_name))
-            breeder = (await session.execute(stmt_breeder)).scalars().first()
-            if not breeder:
-                breeder = BreederORM(name=breeder_name)
-                session.add(breeder)
-                await session.flush()
-
-            # Create CanonicalStrain
-            primary_name = sf_data["name"]
-            
-            # Ensure name uniqueness
-            stmt_cs_name = select(CanonicalStrainORM).where(CanonicalStrainORM.primary_name.ilike(primary_name))
-            strain_orm = (await session.execute(stmt_cs_name)).scalars().first()
+            # ── Step 3: Create/update CanonicalStrain if needed ──
             if not strain_orm:
-                canonical_name = primary_name.replace(" ", "_")
-                stmt_cs_canon = select(CanonicalStrainORM).where(CanonicalStrainORM.primary_name.ilike(canonical_name))
-                strain_orm = (await session.execute(stmt_cs_canon)).scalars().first()
-                if not strain_orm:
-                    strain_orm = CanonicalStrainORM(
-                        primary_name=canonical_name,
-                        breeder_id=breeder.id,
-                        strain_type=sf_data.get("type"),
-                        avg_flowering_days=sf_data.get("flowering_time_days"),
-                        description=sf_data.get("description"),
-                        lineage=sf_data.get("lineage") or {},
-                    )
-                    session.add(strain_orm)
+                # Need to create or find the strain
+                breeder_name = (sf_data.get("breeder") or breeder_slug.replace("-", " ").title()) if sf_data else "Unknown Breeder"
+                stmt_breeder = select(BreederORM).where(BreederORM.name.ilike(breeder_name))
+                breeder = (await session.execute(stmt_breeder)).scalars().first()
+                if not breeder:
+                    breeder = BreederORM(name=breeder_name)
+                    session.add(breeder)
                     await session.flush()
-            else:
-                # If it already exists, update its attributes from sf_data
-                strain_orm.strain_type = sf_data.get("type") or strain_orm.strain_type
-                strain_orm.avg_flowering_days = sf_data.get("flowering_time_days") or strain_orm.avg_flowering_days
-                strain_orm.description = sf_data.get("description") or strain_orm.description
-                strain_orm.lineage = sf_data.get("lineage") or strain_orm.lineage
-                await session.flush()
 
-            # Create alias
+                primary_name = sf_data["name"] if sf_data else search_name.title()
+                
+                # Check if strain already exists by name
+                stmt_cs_name = select(CanonicalStrainORM).where(CanonicalStrainORM.primary_name.ilike(primary_name))
+                strain_orm = (await session.execute(stmt_cs_name)).scalars().first()
+                if not strain_orm:
+                    canonical_name = primary_name.replace(" ", "_")
+                    stmt_cs_canon = select(CanonicalStrainORM).where(CanonicalStrainORM.primary_name.ilike(canonical_name))
+                    strain_orm = (await session.execute(stmt_cs_canon)).scalars().first()
+                    if not strain_orm:
+                        strain_orm = CanonicalStrainORM(
+                            primary_name=canonical_name,
+                            breeder_id=breeder.id,
+                            strain_type=sf_data.get("type") if sf_data else None,
+                            avg_flowering_days=sf_data.get("flowering_time_days") if sf_data else None,
+                            description=sf_data.get("description") if sf_data else None,
+                            lineage=sf_data.get("lineage") or {} if sf_data else {},
+                        )
+                        session.add(strain_orm)
+                        await session.flush()
+                elif sf_data:
+                    # Update existing strain with SeedFinder data
+                    strain_orm.strain_type = sf_data.get("type") or strain_orm.strain_type
+                    strain_orm.avg_flowering_days = sf_data.get("flowering_time_days") or strain_orm.avg_flowering_days
+                    strain_orm.description = sf_data.get("description") or strain_orm.description
+                    strain_orm.lineage = sf_data.get("lineage") or strain_orm.lineage
+                    await session.flush()
+
+            # Use the actual DB strain name for forum searches
+            primary_name = strain_orm.primary_name
+            # Normalize: "Head_Band" → "Head Band" for better forum search results
+            search_query = primary_name.replace("_", " ")
+
+            # ── Step 4: Create alias for caching ──
             alias_orm = StrainAliasORM(
                 canonical_strain_id=strain_orm.id,
                 name=primary_name,
@@ -850,7 +1175,14 @@ async def import_strain(request: Request):
                 source_id=f"{strain_slug}:{breeder_slug}",
             )
             session.add(alias_orm)
-            await session.flush()
+            try:
+                await session.flush()
+            except Exception:
+                # Alias may already exist (unique constraint)
+                await session.rollback()
+                # Re-fetch session state after rollback
+                async for session in get_session():
+                    break
 
             # ── Kannapedia genomic data lookup ──
             yield json.dumps({"type": "progress", "message": "Searching Kannapedia for genomic data...", "posts": 0, "images": 0}) + "\n"
@@ -918,8 +1250,7 @@ async def import_strain(request: Request):
 
             # Scrape forum threads for observations and pictures
             try:
-                search_query = primary_name
-                # Overgrow
+                # Overgrow (Discourse) — DDG-based search returns full post content directly
                 try:
                     search_res = await scraper_client.collect({
                         "source": "discourse",
@@ -931,7 +1262,7 @@ async def import_strain(request: Request):
                     p_saved, i_saved = await _save_forum_posts_to_db(session, search_res.get("items", []), "overgrow", strain_orm.id, search_query)
                     total_posts += p_saved
                     total_images += i_saved
-                    yield json.dumps({"type": "progress", "message": "Overgrow complete. Scraping Rollitup...", "posts": total_posts, "images": total_images}) + "\n"
+                    yield json.dumps({"type": "progress", "message": f"Overgrow complete ({p_saved} posts, {i_saved} images). Scraping Rollitup...", "posts": total_posts, "images": total_images}) + "\n"
                 except Exception as ex:
                     logger.error(f"Failed to scrape Overgrow for {search_query}: {ex}")
 
@@ -1048,6 +1379,22 @@ async def import_strain(request: Request):
                             logger.error(f"Failed to fetch ICMag thread {turl} posts: {ex}")
                 except Exception as ex:
                     logger.error(f"Failed to scrape ICMag for {search_query}: {ex}")
+
+                # Reddit — search cannabis subreddits for strain discussions and grow photos
+                yield json.dumps({"type": "progress", "message": "Scraping Reddit...", "posts": total_posts, "images": total_images}) + "\n"
+                try:
+                    reddit_res = await scraper_client.collect({
+                        "source": "reddit",
+                        "subreddits": ["microgrowery", "cannabiscultivation", "trees", "GrowingMarijuana"],
+                        "query": search_query,
+                        "limit": 10
+                    })
+                    p_saved, i_saved = await _save_forum_posts_to_db(session, reddit_res.get("items", []), "reddit", strain_orm.id, search_query)
+                    total_posts += p_saved
+                    total_images += i_saved
+                    yield json.dumps({"type": "progress", "message": f"Reddit complete ({p_saved} posts, {i_saved} images).", "posts": total_posts, "images": total_images}) + "\n"
+                except Exception as ex:
+                    logger.error(f"Failed to scrape Reddit for {search_query}: {ex}")
             finally:
                 await scraper_client.close()
 
@@ -1072,26 +1419,12 @@ async def import_strain(request: Request):
 async def strain_detail(strain_name: str):
     """Full detail for a single strain — metadata, chemicals, relationships, and observation notes/quotes."""
     async for session in get_session():
-        # Find Canonical Strain or Alias (handle spaces vs underscores)
-        name_space = strain_name.replace("_", " ")
-        name_underscore = strain_name.replace(" ", "_")
-        stmt = select(CanonicalStrainORM).where(
-            or_(
-                CanonicalStrainORM.primary_name.ilike(strain_name),
-                CanonicalStrainORM.primary_name.ilike(name_space),
-                CanonicalStrainORM.primary_name.ilike(name_underscore),
-            )
-        )
+        resolved_name = await get_canonical_strain_name(session, strain_name)
+        if not resolved_name:
+            return JSONResponse({"error": f"Strain '{strain_name}' not found"}, status_code=404)
+            
+        stmt = select(CanonicalStrainORM).where(CanonicalStrainORM.primary_name == resolved_name)
         strain = (await session.execute(stmt)).scalars().first()
-        
-        if not strain:
-            # Try aliases
-            stmt_alias = select(StrainAliasORM).where(StrainAliasORM.name.ilike(strain_name))
-            alias = (await session.execute(stmt_alias)).scalars().first()
-            if alias:
-                stmt = select(CanonicalStrainORM).where(CanonicalStrainORM.id == alias.canonical_strain_id)
-                strain = (await session.execute(stmt)).scalars().first()
-                
         if not strain:
             return JSONResponse({"error": f"Strain '{strain_name}' not found"}, status_code=404)
             
@@ -1244,24 +1577,91 @@ async def strain_detail(strain_name: str):
         
         return result
 
+
+@app.put("/api/strains/{strain_name}/update")
+async def update_strain_metadata(strain_name: str, request: Request):
+    """Manually update canonical strain info: breeder, type, flowering days, description, lineage."""
+    payload = await request.json()
+    async for session in get_session():
+        resolved_name = await get_canonical_strain_name(session, strain_name)
+        if not resolved_name:
+            return JSONResponse({"error": f"Strain '{strain_name}' not found"}, status_code=404)
+            
+        stmt = select(CanonicalStrainORM).where(CanonicalStrainORM.primary_name == resolved_name)
+        strain = (await session.execute(stmt)).scalars().first()
+        if not strain:
+            return JSONResponse({"error": f"Strain '{strain_name}' not found"}, status_code=404)
+            
+        # Update breeder if provided
+        if "breeder" in payload:
+            breeder_name = payload["breeder"].strip() if payload["breeder"] else ""
+            if breeder_name:
+                stmt_breeder = select(BreederORM).where(BreederORM.name.ilike(breeder_name))
+                breeder = (await session.execute(stmt_breeder)).scalars().first()
+                if not breeder:
+                    breeder = BreederORM(name=breeder_name)
+                    session.add(breeder)
+                    await session.flush()
+                strain.breeder_id = breeder.id
+            else:
+                strain.breeder_id = None
+                
+        # Update other fields
+        if "strain_type" in payload:
+            strain.strain_type = payload["strain_type"] or None
+        if "avg_flowering_days" in payload:
+            try:
+                days = payload["avg_flowering_days"]
+                strain.avg_flowering_days = float(days) if days is not None and str(days).strip() != "" else None
+            except (ValueError, TypeError):
+                pass
+        if "description" in payload:
+            strain.description = payload["description"] or None
+        if "lineage" in payload:
+            lineage_val = payload["lineage"]
+            if isinstance(lineage_val, list):
+                strain.lineage = [{"name": p.strip()} for p in lineage_val if isinstance(p, str) and p.strip()]
+            elif isinstance(lineage_val, dict):
+                strain.lineage = lineage_val
+            elif isinstance(lineage_val, str):
+                import re
+                parts = re.split(r'[,xX×·]', lineage_val)
+                strain.lineage = [{"name": p.strip()} for p in parts if p.strip()]
+            else:
+                strain.lineage = {}
+                
+        await session.flush()
+        
+        detail = await strain_detail(resolved_name)
+        return detail
+
+
 # ----- Neighbors & Similarity ----- #
 
 @app.get("/api/strains/{strain_name}/neighbors")
 async def strain_neighbors(strain_name: str, k: int = 10):
     """Find nearest genetic neighbors for a strain."""
     async for session in get_session():
+        resolved_name = await get_canonical_strain_name(session, strain_name)
+        if not resolved_name:
+            resolved_name = strain_name
+            
         state = await load_state_from_db(session)
         if not state["relationships"]:
             return {"error": "No data loaded"}
             
         distances, names = create_distance_matrix(state["strains_data"], state["relationships"])
-        neighbors = get_nearest_neighbors(distances, names, strain_name, k=k)
-        return {"strain": strain_name, "neighbors": neighbors}
+        neighbors = get_nearest_neighbors(distances, names, resolved_name, k=k)
+        return {"strain": resolved_name, "neighbors": neighbors}
 
 @app.get("/api/strains/{strain_name}/similarity")
 async def strain_similarity(strain_name: str):
     """Combined genetic + terpene similarity for a strain."""
     async for session in get_session():
+        resolved_name = await get_canonical_strain_name(session, strain_name)
+        if not resolved_name:
+            resolved_name = strain_name
+            
         state = await load_state_from_db(session)
         if not state["relationships"]:
             return {"error": "No data loaded"}
@@ -1269,8 +1669,8 @@ async def strain_similarity(strain_name: str):
         all_similarities = compute_combined_similarity(
             state["strains_data"], state["relationships"],
         )
-        results = all_similarities.get(strain_name, [])
-        return {"strain": strain_name, "similar": results}
+        results = all_similarities.get(resolved_name, [])
+        return {"strain": resolved_name, "similar": results}
 
 # ----- Terpene APIs ----- #
 
@@ -1278,7 +1678,11 @@ async def strain_similarity(strain_name: str):
 async def terpene_profile(strain_name: str):
     """Normalized terpene profile for radar chart display."""
     async for session in get_session():
-        stmt = select(CanonicalStrainORM).where(CanonicalStrainORM.primary_name.ilike(strain_name))
+        resolved_name = await get_canonical_strain_name(session, strain_name)
+        if not resolved_name:
+            return JSONResponse({"error": "Strain not found"}, status_code=404)
+            
+        stmt = select(CanonicalStrainORM).where(CanonicalStrainORM.primary_name == resolved_name)
         strain = (await session.execute(stmt)).scalars().first()
         if not strain:
             return JSONResponse({"error": "Strain not found"}, status_code=404)

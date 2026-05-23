@@ -193,6 +193,12 @@ body {
   border: 1px solid rgba(156, 39, 176, 0.3);
 }
 
+.search-result-badge.community {
+  background: rgba(255, 152, 0, 0.15);
+  color: var(--accent-orange);
+  border: 1px solid rgba(255, 152, 0, 0.3);
+}
+
 .search-no-results {
   padding: 16px 14px;
   color: var(--text-muted);
@@ -341,6 +347,34 @@ body {
   font-size: 11px;
   font-weight: 500;
   margin-bottom: 14px;
+}
+
+.strain-card .rsp-badge.community {
+  background: rgba(255, 152, 0, 0.15);
+  color: var(--accent-orange);
+  border: 1px solid rgba(255, 152, 0, 0.3);
+}
+
+.community-notice-box {
+  background: rgba(255, 152, 0, 0.08);
+  border: 1px solid rgba(255, 152, 0, 0.2);
+  border-radius: var(--radius-md);
+  padding: 12px;
+  margin-bottom: 16px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-primary);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.community-notice-title {
+  font-weight: 600;
+  color: var(--accent-orange);
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .card-section {

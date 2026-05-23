@@ -164,6 +164,19 @@ class TestKannapediaETL:
         # Should reuse the existing strain, not create a new one
         assert result["strain"].id == existing["Headband"].id
 
+    def test_ingest_resolves_normalized_strain(self):
+        from src.etl.kannapedia_etl import ingest_kannapedia_record
+        from src.models.strain import CanonicalStrain
+
+        # Try to resolve "Headband" (scraped name) to "Head_Band" (existing canonical name)
+        existing = {
+            "Head_Band": CanonicalStrain(primary_name="Head_Band")
+        }
+        result = ingest_kannapedia_record(MOCK_KANNAPEDIA_SCRAPED_PAYLOAD, existing)
+
+        # Should reuse the existing strain despite difference in underscores/spaces
+        assert result["strain"].id == existing["Head_Band"].id
+
     def test_ingest_creates_new_strain_if_not_found(self):
         from src.etl.kannapedia_etl import ingest_kannapedia_record
 

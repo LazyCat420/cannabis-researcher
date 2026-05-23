@@ -197,6 +197,16 @@ async def scrape_seedfinder_strain(
 
     if not html:
         return None
+
+    # ── Detect error/404 pages ──
+    # SeedFinder returns a styled 404 page instead of a proper HTTP 404
+    if any(marker in html.lower() for marker in [
+        "page_not_found", "page not found", "404 not found",
+        "the page you requested could not be found",
+    ]):
+        logger.warning("SeedFinder returned 404/error page for %s/%s", strain_slug, breeder_slug)
+        return None
+
     data = {
         "name": "",
         "breeder": breeder_slug.replace("-", " ").title(),
@@ -216,14 +226,17 @@ async def scrape_seedfinder_strain(
     # ── Name from <title> ──
     title_match = re.search(r"<title>([^(]+)\(", html)
     if title_match:
-        data["name"] = title_match.group(1).strip()
-    else:
+        raw_name = title_match.group(1).strip()
+        # Validate: name shouldn't contain HTML artifacts
+        if "<" not in raw_name and len(raw_name) < 200:
+            data["name"] = raw_name
+    if not data["name"]:
         # Try h1
         h1_match = re.search(r"<h1[^>]*>([^<]+)</h1>", html)
         if h1_match:
             data["name"] = h1_match.group(1).strip()
-        else:
-            data["name"] = strain_slug.replace("-", " ").title()
+    if not data["name"]:
+        data["name"] = strain_slug.replace("-", " ").title()
 
     # ── Type (indica/sativa) ──
     type_match = re.search(

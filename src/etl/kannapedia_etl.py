@@ -52,7 +52,11 @@ def ingest_kannapedia_record(
     blockchain = payload.get("blockchain", {})
 
     # Extract RSP number
-    rsp_number = _extract_rsp(general_info)
+    rsp_number = payload.get("rsp_number") or _extract_rsp(general_info)
+    if not rsp_number and payload.get("source_url"):
+        match = re.search(r"rsp\d+", payload["source_url"], re.IGNORECASE)
+        if match:
+            rsp_number = match.group(0).upper()
 
     # Build source record (raw preservation)
     source_record = SourceGenomicsRecord(
@@ -246,10 +250,21 @@ def _resolve_strain(
     existing_strains: dict[str, CanonicalStrain],
 ) -> CanonicalStrain:
     """Resolve a strain name to an existing canonical strain or create a new one."""
-    # Simple name-based lookup for now
-    name_lower = name.lower().strip()
+    name_stripped = name.strip()
+    name_lower = name_stripped.lower()
+    
+    # 1. Exact match after lowercase / strip
     for existing_name, strain in existing_strains.items():
         if existing_name.lower().strip() == name_lower:
+            return strain
+
+    # 2. Normalized match (remove spaces, underscores, hyphens, and other non-alphanumeric chars)
+    def normalize(val: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", val.lower().strip())
+    
+    name_norm = normalize(name_stripped)
+    for existing_name, strain in existing_strains.items():
+        if normalize(existing_name) == name_norm:
             return strain
 
     # Create new canonical strain

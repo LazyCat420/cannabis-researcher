@@ -99,3 +99,60 @@ async def test_database_connection_and_crud():
         await session.commit()
         break
 
+
+async def test_get_canonical_strain_name():
+    from main import get_canonical_strain_name
+    from src.models.orm import StrainAliasORM
+
+    await init_db()
+
+    async for session in get_session():
+        # Create a mock breeder
+        breeder = BreederORM(
+            name="Alias Test Breeder",
+            website="https://example.com"
+        )
+        session.add(breeder)
+        await session.flush()
+
+        # Create a mock strain with name "Test_GetCanonical_Head_Band"
+        strain = CanonicalStrainORM(
+            primary_name="Test_GetCanonical_Head_Band",
+            breeder_id=breeder.id,
+            strain_type="hybrid"
+        )
+        session.add(strain)
+        await session.flush()
+
+        # Create a mock alias
+        alias = StrainAliasORM(
+            canonical_strain_id=strain.id,
+            name="TestGetCanonicalHeadband Alias",
+            source_name="seedfinder",
+            source_id="testgetcanonicalheadband:breeder"
+        )
+        session.add(alias)
+        await session.commit()
+
+        try:
+            # Test various name lookups
+            # 1. Exact match
+            assert await get_canonical_strain_name(session, "Test_GetCanonical_Head_Band") == "Test_GetCanonical_Head_Band"
+            # 2. Case-insensitive match
+            assert await get_canonical_strain_name(session, "test_getcanonical_head_band") == "Test_GetCanonical_Head_Band"
+            # 3. Punctuation/spacing normalized match
+            assert await get_canonical_strain_name(session, "TestGetCanonicalHeadBand") == "Test_GetCanonical_Head_Band"
+            assert await get_canonical_strain_name(session, "test getcanonical head band") == "Test_GetCanonical_Head_Band"
+            # 4. Alias match
+            assert await get_canonical_strain_name(session, "TestGetCanonicalHeadband Alias") == "Test_GetCanonical_Head_Band"
+            assert await get_canonical_strain_name(session, "testgetcanonicalheadbandalias") == "Test_GetCanonical_Head_Band"
+            # 5. Non-existent strain
+            assert await get_canonical_strain_name(session, "Non Existent Strain") is None
+        finally:
+            # Cleanup
+            await session.delete(alias)
+            await session.delete(strain)
+            await session.delete(breeder)
+            await session.commit()
+        break
+

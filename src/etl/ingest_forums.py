@@ -93,6 +93,29 @@ async def ingest_xenforo(client: ScraperClient, base_url: str, forum_name: str, 
         )
         await _save_posts(posts, forum_name)
 
+def clean_forum_image_url(url: str) -> str:
+    """Extract direct image URL from XenForo/Rollitup proxy.php wrapper URLs if present."""
+    if not url:
+        return ""
+    if "proxy.php?image=" in url or "/proxy.php?image=" in url:
+        try:
+            import urllib.parse
+            import re
+            parsed = urllib.parse.urlparse(url)
+            query = urllib.parse.parse_qs(parsed.query)
+            image_param = query.get("image")
+            if image_param:
+                return image_param[0]
+        except Exception:
+            import urllib.parse
+            import re
+            # Fallback regex if URL parsing fails
+            match = re.search(r'[?&]image=([^&]+)', url)
+            if match:
+                return urllib.parse.unquote(match.group(1))
+    return url
+
+
 async def _save_posts(posts: list[dict], source_name: str):
     if not posts:
         return
@@ -136,9 +159,10 @@ async def _save_posts(posts: list[dict], source_name: str):
             # Save associated images
             image_urls = p.get("image_urls", [])
             for url in image_urls:
+                cleaned_url = clean_forum_image_url(url)
                 img_orm = ObservationImageORM(
                     observation_id=obs.id,
-                    image_url=url
+                    image_url=cleaned_url
                 )
                 session.add(img_orm)
                 
