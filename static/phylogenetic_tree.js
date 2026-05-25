@@ -15,6 +15,9 @@ function renderFullPhylogeneticTree(container, nodes, allRelationships, relType 
     // Sort strains by RSP number for consistent root selection
     allStrains.sort((a, b) => (a.rsp || '').localeCompare(b.rsp || ''));
     
+    const nodesToAdd = [];
+    const edgesToAdd = [];
+    
     function addNodeToTree(nodeId, level) {
         if (processedNodes.has(nodeId)) return;
         
@@ -25,7 +28,7 @@ function renderFullPhylogeneticTree(container, nodes, allRelationships, relType 
         
         // Add node to tree
         const nodeLabel = (node.label || node.id).replace(/_/g, ' ');
-        treeNodes.add({
+        nodesToAdd.push({
             id: nodeId,
             label: nodeLabel,
             level: level,
@@ -67,8 +70,8 @@ function renderFullPhylogeneticTree(container, nodes, allRelationships, relType 
                     const type = rel.type || (relType === 'combined' ? (rel.distance_type || 'genetic') : relType);
                     const edgeColor = type === 'terpene' ? '#00c853' : '#00d2ff';
                     const titlePrefix = type === 'terpene' ? 'Terpene' : 'Genetic';
-
-                    treeEdges.add({
+                    
+                    edgesToAdd.push({
                         id: `edge_${edgeKey}`,
                         from: nodeId,
                         to: childId,
@@ -89,6 +92,13 @@ function renderFullPhylogeneticTree(container, nodes, allRelationships, relType 
     // Start with the first strain as root
     if (allStrains.length > 0) {
         addNodeToTree(allStrains[0].id, 0);
+    }
+    
+    if (nodesToAdd.length > 0) {
+        treeNodes.add(nodesToAdd);
+    }
+    if (edgesToAdd.length > 0) {
+        treeEdges.add(edgesToAdd);
     }
     
     // Create the network

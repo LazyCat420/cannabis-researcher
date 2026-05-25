@@ -326,6 +326,8 @@
       rels = [...gen, ...terp];
     }
 
+    const edgesMap = new Map();
+
     // Add edges to DataSet
     rels.forEach(rel => {
       const type = rel.type;
@@ -336,34 +338,37 @@
       // Filter out extremely weak connections to keep the graph clean
       const maxDist = type === 'genetic' ? 0.35 : 0.5;
       if (rel.distance <= maxDist) {
-        if (state.currentEdges.has(eid)) {
-          const existing = state.edges.get(eid);
-          if (existing && (1 - rel.distance) > existing.value) {
-            state.edges.update({
-              id: eid,
-              value: 1 - rel.distance,
-              length: rel.distance * 350,
-              title: `${titlePrefix} Distance: ${rel.distance.toFixed(3)}`,
-              color: { color: edgeColor, opacity: Math.max(0.1, (1 - rel.distance) * 0.4) },
-              width: Math.max(0.5, 2 * (1 - rel.distance)),
-            });
+        const value = 1 - rel.distance;
+        if (edgesMap.has(eid)) {
+          const existing = edgesMap.get(eid);
+          if (value > existing.value) {
+            existing.value = value;
+            existing.length = rel.distance * 350;
+            existing.title = `${titlePrefix} Distance: ${rel.distance.toFixed(3)}`;
+            existing.color = { color: edgeColor, opacity: Math.max(0.1, value * 0.4) };
+            existing.width = Math.max(0.5, 2 * value);
           }
           return;
         }
 
-        state.edges.add({
+        const newEdge = {
           id: eid,
           from: rel.from,
           to: rel.to,
-          value: 1 - rel.distance,
+          value: value,
           length: rel.distance * 350,
           title: `${titlePrefix} Distance: ${rel.distance.toFixed(3)}`,
-          color: { color: edgeColor, opacity: Math.max(0.1, (1 - rel.distance) * 0.4) },
-          width: Math.max(0.5, 2 * (1 - rel.distance)),
-        });
+          color: { color: edgeColor, opacity: Math.max(0.1, value * 0.4) },
+          width: Math.max(0.5, 2 * value),
+        };
+        edgesMap.set(eid, newEdge);
         state.currentEdges.add(eid);
       }
     });
+
+    if (edgesMap.size > 0) {
+      state.edges.add(Array.from(edgesMap.values()));
+    }
 
     // If there is an active node, apply the highlight immediately
     if (state.activeNodes.size > 0) {
@@ -371,6 +376,7 @@
       highlightNeighborhood(activeNodeId);
     }
   }
+
 
   // ── Strain Detail Panel ──
   async function loadStrainDetail(strainName, source, strainSlug, breederSlug, realName, force = false) {
