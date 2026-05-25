@@ -52,7 +52,7 @@ function renderFullPhylogeneticTree(container, nodes, allRelationships, relType 
         const relationships = allRelationships
             .filter(rel => {
                 const isConnected = (rel.from === nodeId || rel.to === nodeId);
-                const withinDistance = rel.distance < maxDist;
+                const withinDistance = rel.distance < maxDist || rel.is_top_5 || rel.guaranteed;
                 const otherNode = rel.from === nodeId ? rel.to : rel.from;
                 const hasValidNode = nodes.get(otherNode);
                 return isConnected && withinDistance && hasValidNode;

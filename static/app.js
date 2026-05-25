@@ -335,9 +335,10 @@
       const titlePrefix = type === 'genetic' ? 'Genetic' : 'Terpene';
       const eid = [rel.from, rel.to].sort().join('|') + `|${type}`;
       
-      // Filter out extremely weak connections to keep the graph clean
+      // Filter out extremely weak connections to keep the graph clean,
+      // but always allow top 5 closest terpene connections.
       const maxDist = type === 'genetic' ? 0.35 : 0.5;
-      if (rel.distance <= maxDist) {
+      if (rel.distance <= maxDist || rel.is_top_5 || rel.guaranteed) {
         const value = 1 - rel.distance;
         if (edgesMap.has(eid)) {
           const existing = edgesMap.get(eid);
