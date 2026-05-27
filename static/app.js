@@ -206,8 +206,8 @@
     state.activeNodes.clear();
     state.activeNodes.add(nodeId);
     
-    // Re-populate edges first (if showLineage is false, this includes the active node's lineage edges!)
-    if (state.relType !== 'lineage' && !state.showLineage) {
+    // Re-populate edges if relation type is terpene/combined, or if showLineage is false
+    if (state.relType === 'terpene' || state.relType === 'combined' || (state.relType !== 'lineage' && !state.showLineage)) {
       refreshAllEdges();
     } else {
       highlightNeighborhood(nodeId);
@@ -320,8 +320,8 @@
     });
     state.nodes.update(nodeUpdates);
 
-    // If showLineage is false, rebuild the edges to remove the deselected node's lineage edges
-    if (state.relType !== 'lineage' && !state.showLineage) {
+    // Rebuild edges to clear terpene/lineage details if relation type is terpene/combined, or if showLineage is false
+    if (state.relType === 'terpene' || state.relType === 'combined' || (state.relType !== 'lineage' && !state.showLineage)) {
       refreshAllEdges();
       return;
     }
@@ -365,11 +365,15 @@
       rels = [...gen, ...terp, ...lin];
     }
 
+    const activeNodeId = state.activeNodes.size > 0 ? Array.from(state.activeNodes)[0] : null;
+
     // Filter out lineage relationships if showLineage is false and we aren't explicitly in the lineage view
     if (state.relType !== 'lineage' && !state.showLineage) {
-      const activeNodeId = state.activeNodes.size > 0 ? Array.from(state.activeNodes)[0] : null;
       rels = rels.filter(r => r.type !== 'lineage' || (activeNodeId && (r.from === activeNodeId || r.to === activeNodeId)));
     }
+
+    // Filter out terpene relationships unless they connect to the currently active node
+    rels = rels.filter(r => r.type !== 'terpene' || (activeNodeId && (r.from === activeNodeId || r.to === activeNodeId)));
 
     const edgesMap = new Map();
 
