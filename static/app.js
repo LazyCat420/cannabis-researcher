@@ -165,6 +165,7 @@
 
     // Disable physics after stabilization
     state.network.once('stabilizationIterationsDone', () => {
+      freezePositions();
       state.network.setOptions({ physics: { enabled: false } });
       state.physicsOn = false;
     });
@@ -987,6 +988,7 @@
         
         // Re-enable physics to stabilize only if physics is currently enabled
         if (state.network && state.physicsOn) {
+          unfreezePositions();
           state.network.setOptions({
             physics: {
               ...CALM_PHYSICS,
@@ -1523,6 +1525,7 @@
     
     // Re-enable physics to allow the graph to re-stabilize and cluster according to the new relationships only if physics is currently enabled
     if (state.network && state.physicsOn) {
+      unfreezePositions();
       state.network.setOptions({
         physics: {
           ...CALM_PHYSICS,
@@ -1612,6 +1615,9 @@
   // ── Physics Toggle ──
   function togglePhysics() {
     state.physicsOn = !state.physicsOn;
+    if (state.physicsOn) {
+      unfreezePositions();
+    }
     state.network.setOptions({
       physics: {
         ...CALM_PHYSICS,
@@ -1619,6 +1625,9 @@
         stabilization: { enabled: true, iterations: 100 }
       },
     });
+    if (!state.physicsOn) {
+      freezePositions();
+    }
     document.getElementById('btn-physics').classList.toggle('active', state.physicsOn);
   }
 
@@ -1830,6 +1839,27 @@
       drawLineageConnections(treeWrapper);
     });
     resizeObserver.observe(treeWrapper);
+  }
+
+  function freezePositions() {
+    if (!state.network || !state.nodes) return;
+    const positions = state.network.getPositions();
+    const updates = Object.keys(positions).map(id => ({
+      id: id,
+      x: positions[id].x,
+      y: positions[id].y
+    }));
+    state.nodes.update(updates);
+  }
+
+  function unfreezePositions() {
+    if (!state.nodes) return;
+    const updates = state.nodes.get().map(node => ({
+      id: node.id,
+      x: undefined,
+      y: undefined
+    }));
+    state.nodes.update(updates);
   }
 
 })();
