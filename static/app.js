@@ -985,19 +985,14 @@
         state.showLineage = e.target.checked;
         refreshAllEdges();
         
-        // Re-enable physics to stabilize
-        if (state.network) {
+        // Re-enable physics to stabilize only if physics is currently enabled
+        if (state.network && state.physicsOn) {
           state.network.setOptions({
             physics: {
               ...CALM_PHYSICS,
               enabled: true,
               stabilization: { enabled: true, iterations: 150, updateInterval: 25 }
             }
-          });
-          state.physicsOn = true;
-          state.network.once('stabilizationIterationsDone', () => {
-            state.network.setOptions({ physics: { enabled: false } });
-            state.physicsOn = false;
           });
         }
       });
@@ -1526,20 +1521,14 @@
     // Clear and rebuild edges for the new relation type
     refreshAllEdges();
     
-    // Re-enable physics to allow the graph to re-stabilize and cluster according to the new relationships!
-    if (state.network) {
+    // Re-enable physics to allow the graph to re-stabilize and cluster according to the new relationships only if physics is currently enabled
+    if (state.network && state.physicsOn) {
       state.network.setOptions({
         physics: {
           ...CALM_PHYSICS,
           enabled: true,
           stabilization: { enabled: true, iterations: 150, updateInterval: 25 }
         }
-      });
-      state.physicsOn = true;
-      // After stabilization, turn off physics again
-      state.network.once('stabilizationIterationsDone', () => {
-        state.network.setOptions({ physics: { enabled: false } });
-        state.physicsOn = false;
       });
     }
   }
